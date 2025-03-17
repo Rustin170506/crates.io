@@ -66,6 +66,9 @@ jobs:
         with:
           files: Cargo.lock
 
+      - name: Force failure
+        run: exit 1
+
     outputs:
       non-js: ${{ steps.changed-files-non-js.outputs.any_modified }}
       non-rust: ${{ steps.changed-files-non-rust.outputs.any_modified }}
