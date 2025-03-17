@@ -75,7 +75,7 @@ jobs:
     name: Frontend / Percy Nonce
     runs-on: ubuntu-latest
     needs: changed-files
-    if: needs.changed-files.outputs.non-rust == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-rust == 'true'
 
     # persist job results to other jobs in the workflow
     outputs:
@@ -91,7 +91,7 @@ jobs:
     name: Backend / Lint
     runs-on: ubuntu-24.04
     needs: changed-files
-    if: needs.changed-files.outputs.non-js == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-js == 'true'
 
     env:
       RUSTFLAGS: "-D warnings"
@@ -117,7 +117,7 @@ jobs:
     name: Backend / dependencies
     runs-on: ubuntu-24.04
     needs: changed-files
-    if: github.event_name != 'pull_request' || needs.changed-files.outputs.rust-lockfile == 'true'
+    if: always() && (needs.changed-files.result == 'success') && (github.event_name != 'pull_request' || needs.changed-files.outputs.rust-lockfile == 'true')
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -138,7 +138,7 @@ jobs:
     name: Backend / Test
     runs-on: ubuntu-24.04
     needs: changed-files
-    if: needs.changed-files.outputs.non-js == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-js == 'true'
 
     env:
       RUST_BACKTRACE: 1
@@ -170,7 +170,7 @@ jobs:
     name: Frontend / Lint
     runs-on: ubuntu-24.04
     needs: changed-files
-    if: needs.changed-files.outputs.non-rust == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-rust == 'true'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -197,7 +197,7 @@ jobs:
     name: Frontend / Test
     runs-on: ubuntu-24.04
     needs: [changed-files, percy-nonce]
-    if: needs.changed-files.outputs.non-rust == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-rust == 'true'
 
     env:
       JOBS: 1 # See https://git.io/vdao3 for details.
@@ -234,7 +234,7 @@ jobs:
     name: Frontend / Test (@crates-io/msw)
     runs-on: ubuntu-24.04
     needs: [changed-files]
-    if: needs.changed-files.outputs.non-rust == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-rust == 'true'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -259,7 +259,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [changed-files, percy-nonce]
     timeout-minutes: 60
-    if: needs.changed-files.outputs.non-rust == 'true'
+    if: always() && (needs.changed-files.result == 'success') && needs.changed-files.outputs.non-rust == 'true'
 
     env:
       JOBS: 1 # See https://git.io/vdao3 for details.
