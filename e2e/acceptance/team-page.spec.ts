@@ -3,7 +3,7 @@ import { loadFixtures } from '@crates-io/msw/fixtures';
 
 test.describe('Acceptance | team page', { tag: '@acceptance' }, () => {
   test.beforeEach(async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
     await page.goto('/teams/github:org:thehydroimpulse');
   });
 
@@ -12,6 +12,7 @@ test.describe('Acceptance | team page', { tag: '@acceptance' }, () => {
     await expect(page.locator('[data-test-heading] [data-test-team-name]')).toHaveText('thehydroimpulseteam');
 
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
     await a11y.audit();
   });
 

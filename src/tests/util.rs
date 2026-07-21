@@ -1,12 +1,12 @@
 //! This module provides utility types and traits for managing a test session
 //!
-//! Tests start by using one of the `TestApp` constructors: `init`, `with_proxy`, or `full`.  This returns a
+//! Tests start by using one of the `TestApp` constructors: `init` or `full`.  This returns a
 //! `TestAppBuilder` which provides convenience methods for creating up to one user, optionally with
 //! a token.  The builder methods all return at least an initialized `TestApp` and a
 //! `MockAnonymousUser`.  The `MockAnonymousUser` can be used to issue requests in an
 //! unauthenticated session.
 //!
-//! A `TestApp` value provides raw access to the database through the `db` function and can
+//! A `TestApp` value provides raw access to the database through the `db_conn` function and can
 //! construct new users via the `db_new_user` function.  This function returns a
 //! `MockCookieUser`, which can be used to generate one or more tokens via its `db_new_token`
 //! function, which in turn returns a `MockTokenUser`.
@@ -19,21 +19,21 @@
 //! `MockCookieUser` and `MockTokenUser` provide an `as_model` function which returns a reference
 //! to the underlying database model value (`User` and `ApiToken` respectively).
 
-use crate::models::{ApiToken, User};
-use crate::tests::{
+use crate::{
     CategoryListResponse, CategoryResponse, CrateList, CrateResponse, GoodCrate, OwnerResp,
     OwnersResponse, VersionResponse,
 };
+use crates_io::models::{ApiToken, User};
 use std::future::Future;
 
 use http::{Method, Request};
 
-use crate::models::token::{CrateScope, EndpointScope, NewApiToken};
-use crate::util::token::PlainToken;
 use axum::body::{Body, Bytes};
 use axum::extract::connect_info::MockConnectInfo;
 use chrono::{DateTime, Utc};
 use cookie::Cookie;
+use crates_io::models::token::{CrateScope, EndpointScope, NewApiToken};
+use crates_io::util::token::PlainToken;
 use futures_util::FutureExt;
 use http::header;
 use secrecy::ExposeSecret;
@@ -92,7 +92,7 @@ pub trait RequestHelper {
     fn request_builder(&self, method: Method, path: &str) -> MockRequest;
     fn app(&self) -> &TestApp;
 
-    /// Run a request that is expected to succeed
+    /// Runs a request that is expected to succeed
     fn run<T>(&self, request: Request<impl Into<Body>>) -> impl Future<Output = Response<T>> {
         let app = self.app();
         let request = request.map(Into::into);
@@ -117,29 +117,38 @@ pub trait RequestHelper {
         inner(app, request).map(Response::new)
     }
 
-    /// Create a get request
+    /// Creates a GET request
     fn get_request(&self, path: &str) -> MockRequest {
         self.request_builder(Method::GET, path)
     }
 
-    /// Create a POST request
+    /// Creates a POST request
     fn post_request(&self, path: &str) -> MockRequest {
         self.request_builder(Method::POST, path)
     }
 
-    /// Issue a GET request
+    /// Issues a GET request
     async fn get<T>(&self, path: &str) -> Response<T> {
         self.run(self.get_request(path)).await
     }
 
-    /// Issue a GET request that includes query parameters
+    /// Issues a GET request that includes query parameters
     async fn get_with_query<T>(&self, path: &str, query: &str) -> Response<T> {
         let path_and_query = format!("{path}?{query}");
         let request = self.request_builder(Method::GET, &path_and_query);
         self.run(request).await
     }
 
-    /// Issue a PUT request
+    /// Issues a POST request
+    async fn post<T>(&self, path: &str, body: impl Into<Bytes>) -> Response<T> {
+        let request = self
+            .request_builder(Method::POST, path)
+            .with_body(body.into());
+
+        self.run(request).await
+    }
+
+    /// Issues a PUT request
     async fn put<T>(&self, path: &str, body: impl Into<Bytes>) -> Response<T> {
         let request = self
             .request_builder(Method::PUT, path)
@@ -148,7 +157,7 @@ pub trait RequestHelper {
         self.run(request).await
     }
 
-    /// Issue a PATCH request
+    /// Issues a PATCH request
     async fn patch<T>(&self, path: &str, body: impl Into<Bytes>) -> Response<T> {
         let request = self
             .request_builder(Method::PATCH, path)
@@ -157,13 +166,13 @@ pub trait RequestHelper {
         self.run(request).await
     }
 
-    /// Issue a DELETE request
+    /// Issues a DELETE request
     async fn delete<T>(&self, path: &str) -> Response<T> {
         let request = self.request_builder(Method::DELETE, path);
         self.run(request).await
     }
 
-    /// Issue a DELETE request with a body... yes we do it, for crate owner removal
+    /// Issues a DELETE request with a body... yes we do it, for crate owner removal
     async fn delete_with_body<T>(&self, path: &str, body: impl Into<Bytes>) -> Response<T> {
         let request = self
             .request_builder(Method::DELETE, path)
@@ -172,12 +181,18 @@ pub trait RequestHelper {
         self.run(request).await
     }
 
-    /// Search for crates matching a query string
+    /// Searches for crates matching a query string
     async fn search(&self, query: &str) -> CrateList {
         self.get_with_query("/api/v1/crates", query).await.good()
     }
 
-    /// Publish the crate and run background jobs to completion
+    /// Requests the JSON used for the admin list page
+    async fn admin_list<T>(&self, owner: &str) -> Response<T> {
+        let url = format!("/api/private/admin_list/{owner}");
+        self.get(&url).await
+    }
+
+    /// Publishes the crate and runs background jobs to completion
     ///
     /// Background jobs will publish to the git index and sync to the HTTP index.
     async fn publish_crate(&self, body: impl Into<Bytes>) -> Response<GoodCrate> {
@@ -186,19 +201,19 @@ pub trait RequestHelper {
         response
     }
 
-    /// Request the JSON used for a crate's page
+    /// Requests the JSON used for a crate's page
     async fn show_crate(&self, krate_name: &str) -> CrateResponse {
         let url = format!("/api/v1/crates/{krate_name}");
         self.get(&url).await.good()
     }
 
-    /// Request the JSON used to list a crate's owners
+    /// Requests the JSON used to list a crate's owners
     async fn show_crate_owners(&self, krate_name: &str) -> OwnersResponse {
         let url = format!("/api/v1/crates/{krate_name}/owners");
         self.get(&url).await.good()
     }
 
-    /// Request the JSON used for a crate version's page
+    /// Requests the JSON used for a crate version's page
     async fn show_version(&self, krate_name: &str, version: &str) -> VersionResponse {
         let url = format!("/api/v1/crates/{krate_name}/{version}");
         self.get(&url).await.good()
@@ -214,7 +229,7 @@ pub trait RequestHelper {
         self.get(url).await.good()
     }
 
-    /// Add to the specified crate the specified owners.
+    /// Adds to the specified crate the specified owners.
     async fn add_named_owners<T>(&self, krate_name: &str, owners: &[T]) -> Response<OwnerResp>
     where
         T: serde::Serialize,
@@ -224,19 +239,19 @@ pub trait RequestHelper {
         self.put(&url, body).await
     }
 
-    /// Add a single owner to the specified crate.
+    /// Adds a single owner to the specified crate.
     async fn add_named_owner(&self, krate_name: &str, owner: &str) -> Response<OwnerResp> {
         self.add_named_owners(krate_name, &[owner]).await
     }
 
-    /// Remove from the specified crate the specified owners.
+    /// Removes from the specified crate the specified owners.
     async fn remove_named_owners(&self, krate_name: &str, owners: &[&str]) -> Response<OwnerResp> {
         let url = format!("/api/v1/crates/{krate_name}/owners");
         let body = json!({ "owners": owners }).to_string();
         self.delete_with_body(&url, body).await
     }
 
-    /// Remove a single owner to the specified crate.
+    /// Remove a single owner from the specified crate.
     async fn remove_named_owner(&self, krate_name: &str, owner: &str) -> Response<OwnerResp> {
         self.remove_named_owners(krate_name, &[owner]).await
     }
@@ -318,7 +333,7 @@ impl MockCookieUser {
         endpoint_scopes: Option<Vec<EndpointScope>>,
         expired_at: Option<DateTime<Utc>>,
     ) -> MockTokenUser {
-        let mut conn = self.app().db_conn().await;
+        let conn = self.app().db_conn().await;
 
         let plaintext = PlainToken::generate();
 
@@ -331,12 +346,12 @@ impl MockCookieUser {
             .maybe_expired_at(expired_at)
             .build();
 
-        let token = new_token.insert(&mut conn).await.unwrap();
+        let token = new_token.insert(&conn).await.unwrap();
 
         MockTokenUser {
             app: self.app.clone(),
-            token,
-            plaintext,
+            token: Some(token),
+            plaintext: plaintext.expose_secret().into(),
         }
     }
 }
@@ -344,14 +359,14 @@ impl MockCookieUser {
 /// A type that can generate token authenticated requests
 pub struct MockTokenUser {
     app: TestApp,
-    token: ApiToken,
-    plaintext: PlainToken,
+    token: Option<ApiToken>,
+    plaintext: String,
 }
 
 impl RequestHelper for MockTokenUser {
     fn request_builder(&self, method: Method, path: &str) -> MockRequest {
         let mut request = req(method, path);
-        request.header(header::AUTHORIZATION, self.plaintext.expose_secret());
+        request.header(header::AUTHORIZATION, &self.plaintext);
         request
     }
 
@@ -361,12 +376,21 @@ impl RequestHelper for MockTokenUser {
 }
 
 impl MockTokenUser {
-    /// Returns a reference to the database `ApiToken` model
-    pub fn as_model(&self) -> &ApiToken {
-        &self.token
+    pub fn with_auth_header(token: String, app: TestApp) -> Self {
+        Self {
+            app,
+            token: None,
+            plaintext: token,
+        }
     }
 
-    pub fn plaintext(&self) -> &PlainToken {
+    /// Returns a reference to the database `ApiToken` model
+    pub fn as_model(&self) -> &ApiToken {
+        const ERROR: &str = "Original `ApiToken` was not set on this `MockTokenUser` instance";
+        self.token.as_ref().expect(ERROR)
+    }
+
+    pub fn plaintext(&self) -> &str {
         &self.plaintext
     }
 }

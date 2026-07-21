@@ -7,7 +7,7 @@
 use anyhow::Result;
 use crates_io::worker::jobs;
 use crates_io::{db, schema::*};
-use crates_io_diesel_helpers::canon_crate_name;
+use crates_io_database::fns::canon_crate_name;
 use crates_io_env_vars::{required_var, var, var_parsed};
 use crates_io_pagerduty as pagerduty;
 use crates_io_pagerduty::PagerdutyClient;
@@ -18,9 +18,8 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_token = required_var("PAGERDUTY_API_TOKEN")?.into();
-    let service_key = required_var("PAGERDUTY_INTEGRATION_KEY")?;
-    let client = PagerdutyClient::new(api_token, service_key);
+    let service_key = required_var("PAGERDUTY_INTEGRATION_KEY")?.into();
+    let client = PagerdutyClient::new(service_key);
 
     let conn = &mut db::oneoff_connection().await?;
 
@@ -30,7 +29,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Check for old background jobs that are not currently running.
+/// Checks for old background jobs that are not currently running.
 ///
 /// This check includes `skip_locked` in the query and will only trigger on
 /// enqueued jobs that have attempted to run and have failed (and are in the
@@ -84,9 +83,9 @@ async fn check_failing_background_jobs(
     Ok(())
 }
 
-/// Check for an `update_downloads` job that has run longer than expected
+/// Checks for an `update_downloads` job that has run longer than expected
 async fn check_stalled_update_downloads(
-    conn: &mut AsyncPgConnection,
+    mut conn: &AsyncPgConnection,
     pagerduty: &PagerdutyClient,
 ) -> Result<()> {
     use chrono::{DateTime, Utc};
@@ -101,7 +100,7 @@ async fn check_stalled_update_downloads(
     let start_time: Result<DateTime<Utc>, _> = background_jobs::table
         .filter(background_jobs::job_type.eq(jobs::UpdateDownloads::JOB_NAME))
         .select(background_jobs::created_at)
-        .first(conn)
+        .first(&mut conn)
         .await;
 
     if let Ok(start_time) = start_time {
@@ -129,9 +128,9 @@ async fn check_stalled_update_downloads(
     .await
 }
 
-/// Check for known spam patterns
+/// Checks for known spam patterns
 async fn check_spam_attack(
-    conn: &mut AsyncPgConnection,
+    mut conn: &AsyncPgConnection,
     pagerduty: &PagerdutyClient,
 ) -> Result<()> {
     const EVENT_KEY: &str = "spam_attack";
@@ -149,7 +148,7 @@ async fn check_spam_attack(
     let bad_crate: Option<String> = crates::table
         .filter(canon_crate_name(crates::name).eq_any(bad_crate_names))
         .select(crates::name)
-        .first(conn)
+        .first(&mut conn)
         .await
         .optional()?;
 

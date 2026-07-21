@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::NaiveDate;
 use crates_io::db;
-use crates_io::schema::{background_jobs, crates};
+use crates_io::models::OauthGithub;
+use crates_io::schema::{background_jobs, crates, oauth_github};
 use crates_io::worker::jobs;
 use crates_io_worker::BackgroundJob;
 use diesel::dsl::exists;
@@ -15,40 +16,55 @@ use diesel_async::RunQueryDsl;
     rename_all = "snake_case"
 )]
 pub enum Command {
+    /// Archive the given snapshot branch to the configured archive repository
+    /// (`GIT_ARCHIVE_REPO_URL`). No-op if the archive URL is not configured.
+    ArchiveIndexBranch {
+        /// Name of the snapshot branch to archive (e.g. `snapshot-2026-04-21`)
+        branch: String,
+    },
     ArchiveVersionDownloads {
         #[arg(long)]
         /// The date before which to archive version downloads (default: 90 days ago)
         before: Option<NaiveDate>,
     },
-    IndexVersionDownloadsArchive,
-    UpdateDownloads,
-    CleanProcessedLogFiles,
-    DumpDb,
-    DailyDbMaintenance,
-    SquashIndex,
-    NormalizeIndex {
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-    },
     CheckTyposquat {
         #[arg()]
         name: String,
     },
+    CleanProcessedLogFiles,
+    DailyDbMaintenance,
+    DumpDb,
+    /// Generate OpenGraph images for the specified crates
+    GenerateOgImage {
+        /// Crate names to generate OpenGraph images for
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    IndexVersionDownloadsArchive,
+    NormalizeIndex {
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
     ProcessCdnLogQueue(jobs::ProcessCdnLogQueue),
+    SendTokenExpiryNotifications,
+    SquashIndex,
     SyncAdmins {
         /// Force a sync even if one is already in progress
         #[arg(long)]
         force: bool,
     },
-    SendTokenExpiryNotifications,
     SyncCratesFeed,
-    SyncToGitIndex {
-        name: String,
-    },
-    SyncToSparseIndex {
-        name: String,
-    },
     SyncUpdatesFeed,
+    TrustpubCleanup,
+    UpdateDownloads,
+    /// Sync the oldest batch of users with GitHub
+    UpdateUserBatch {
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        #[arg(long = "batch-size", default_value = "100")]
+        batch_size: usize,
+    },
 }
 
 pub async fn run(command: Command) -> Result<()> {
@@ -56,39 +72,60 @@ pub async fn run(command: Command) -> Result<()> {
     println!("Enqueueing background job: {command:?}");
 
     match command {
+        Command::ArchiveIndexBranch { branch } => {
+            jobs::ArchiveIndexBranch::new(branch).enqueue(&conn).await?;
+        }
         Command::ArchiveVersionDownloads { before } => {
             before
                 .map(jobs::ArchiveVersionDownloads::before)
                 .unwrap_or_default()
-                .enqueue(&mut conn)
+                .enqueue(&conn)
                 .await?;
         }
-        Command::IndexVersionDownloadsArchive => {
-            jobs::IndexVersionDownloadsArchive
-                .enqueue(&mut conn)
-                .await?;
-        }
-        Command::UpdateDownloads => {
-            let count: i64 = background_jobs::table
-                .filter(background_jobs::job_type.eq(jobs::UpdateDownloads::JOB_NAME))
+        Command::CheckTyposquat { name } => {
+            // The job will fail if the crate doesn't actually exist, so let's check that up front.
+            if crates::table
+                .filter(crates::name.eq(&name))
                 .count()
-                .get_result(&mut conn)
-                .await?;
-
-            if count > 0 {
-                println!(
-                    "Did not enqueue {}, existing job already in progress",
-                    jobs::UpdateDownloads::JOB_NAME
+                .get_result::<i64>(&mut conn)
+                .await?
+                == 0
+            {
+                anyhow::bail!(
+                    "cannot enqueue a typosquat check for a crate that doesn't exist: {name}"
                 );
-            } else {
-                jobs::UpdateDownloads.enqueue(&mut conn).await?;
             }
+
+            jobs::CheckTyposquat::new(&name).enqueue(&conn).await?;
         }
         Command::CleanProcessedLogFiles => {
-            jobs::CleanProcessedLogFiles.enqueue(&mut conn).await?;
+            jobs::CleanProcessedLogFiles.enqueue(&conn).await?;
+        }
+        Command::DailyDbMaintenance => {
+            jobs::DailyDbMaintenance.enqueue(&conn).await?;
         }
         Command::DumpDb => {
-            jobs::DumpDb.enqueue(&mut conn).await?;
+            jobs::DumpDb::default().enqueue(&conn).await?;
+        }
+        Command::GenerateOgImage { names } => {
+            for name in names {
+                jobs::GenerateOgImage::new(name).enqueue(&conn).await?;
+            }
+        }
+        Command::IndexVersionDownloadsArchive => {
+            jobs::IndexVersionDownloadsArchive.enqueue(&conn).await?;
+        }
+        Command::NormalizeIndex { dry_run } => {
+            jobs::NormalizeIndex::new(dry_run).enqueue(&conn).await?;
+        }
+        Command::ProcessCdnLogQueue(job) => {
+            job.enqueue(&conn).await?;
+        }
+        Command::SendTokenExpiryNotifications => {
+            jobs::SendTokenExpiryNotifications.enqueue(&conn).await?;
+        }
+        Command::SquashIndex => {
+            jobs::SquashIndex.enqueue(&conn).await?;
         }
         Command::SyncAdmins { force } => {
             if !force {
@@ -110,56 +147,62 @@ pub async fn run(command: Command) -> Result<()> {
                 }
             }
 
-            jobs::SyncAdmins.enqueue(&mut conn).await?;
-        }
-        Command::DailyDbMaintenance => {
-            jobs::DailyDbMaintenance.enqueue(&mut conn).await?;
-        }
-        Command::ProcessCdnLogQueue(job) => {
-            job.enqueue(&mut conn).await?;
-        }
-        Command::SquashIndex => {
-            jobs::SquashIndex.enqueue(&mut conn).await?;
-        }
-        Command::NormalizeIndex { dry_run } => {
-            jobs::NormalizeIndex::new(dry_run)
-                .enqueue(&mut conn)
-                .await?;
-        }
-        Command::CheckTyposquat { name } => {
-            // The job will fail if the crate doesn't actually exist, so let's check that up front.
-            if crates::table
-                .filter(crates::name.eq(&name))
-                .count()
-                .get_result::<i64>(&mut conn)
-                .await?
-                == 0
-            {
-                anyhow::bail!(
-                    "cannot enqueue a typosquat check for a crate that doesn't exist: {name}"
-                );
-            }
-
-            jobs::CheckTyposquat::new(&name).enqueue(&mut conn).await?;
-        }
-        Command::SendTokenExpiryNotifications => {
-            jobs::SendTokenExpiryNotifications
-                .enqueue(&mut conn)
-                .await?;
+            jobs::SyncAdmins.enqueue(&conn).await?;
         }
         Command::SyncCratesFeed => {
-            jobs::rss::SyncCratesFeed.enqueue(&mut conn).await?;
-        }
-        Command::SyncToGitIndex { name } => {
-            jobs::SyncToGitIndex::new(name).enqueue(&mut conn).await?;
-        }
-        Command::SyncToSparseIndex { name } => {
-            jobs::SyncToSparseIndex::new(name)
-                .enqueue(&mut conn)
-                .await?;
+            jobs::rss::SyncCratesFeed.enqueue(&conn).await?;
         }
         Command::SyncUpdatesFeed => {
-            jobs::rss::SyncUpdatesFeed.enqueue(&mut conn).await?;
+            jobs::rss::SyncUpdatesFeed.enqueue(&conn).await?;
+        }
+        Command::TrustpubCleanup => {
+            let job = jobs::trustpub::DeleteExpiredTokens;
+            job.enqueue(&conn).await?;
+
+            let job = jobs::trustpub::DeleteExpiredJtis;
+            job.enqueue(&conn).await?;
+        }
+        Command::UpdateDownloads => {
+            let count: i64 = background_jobs::table
+                .filter(background_jobs::job_type.eq(jobs::UpdateDownloads::JOB_NAME))
+                .count()
+                .get_result(&mut conn)
+                .await?;
+
+            if count > 0 {
+                println!(
+                    "Did not enqueue {}, existing job already in progress",
+                    jobs::UpdateDownloads::JOB_NAME
+                );
+            } else {
+                jobs::UpdateDownloads.enqueue(&conn).await?;
+            }
+        }
+
+        Command::UpdateUserBatch {
+            dry_run,
+            batch_size,
+        } => {
+            let oldest_oauth_github_records = oauth_github::table
+                .order(oauth_github::last_sync.asc())
+                .limit(batch_size as i64)
+                .load::<OauthGithub>(&mut conn)
+                .await?;
+
+            for oauth_github in oldest_oauth_github_records {
+                let job = jobs::UpdateUserFromGithub {
+                    dry_run,
+                    account_id: oauth_github.account_id,
+                };
+
+                // Don't stop the whole batch if one enqueue errors, but do log the error
+                if let Err(e) = job.enqueue(&conn).await {
+                    error!(
+                        "Error enqueueing UpdateUserFromGithub for user_id {}, github_id {}, old username `{}`: {e}",
+                        oauth_github.user_id, oauth_github.account_id, oauth_github.login,
+                    );
+                }
+            }
         }
     };
 

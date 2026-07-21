@@ -1,11 +1,12 @@
-use crate::models::Category;
-use crate::tests::builders::CrateBuilder;
-use crate::tests::new_category;
-use crate::tests::util::{MockAnonymousUser, RequestHelper, TestApp};
+use crate::builders::CrateBuilder;
+use crate::new_category;
+use crate::util::{MockAnonymousUser, RequestHelper, TestApp};
+use claims::assert_ok;
+use crates_io::models::Category;
 use crates_io_database::schema::categories;
 use diesel::insert_into;
 use diesel_async::RunQueryDsl;
-use insta::assert_json_snapshot;
+use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -16,7 +17,8 @@ async fn show() -> anyhow::Result<()> {
     let url = "/api/v1/categories/foo-bar";
 
     // Return not found if a category doesn't exist
-    anon.get(url).await.assert_not_found();
+    let response = anon.get::<()>(url).await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 
     // Create a category and a subcategory
     let cats = vec![
@@ -36,6 +38,17 @@ async fn show() -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn null_byte_in_slug() {
+    let (_app, anon) = TestApp::init().empty().await;
+
+    // A category slug with a null byte can never exist, so instead of letting
+    // the request fail with a database encoding error it should be treated as a
+    // regular "not found" response.
+    let response = anon.get::<()>("/api/v1/categories/foo%00bar").await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]

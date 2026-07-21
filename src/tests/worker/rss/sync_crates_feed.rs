@@ -1,11 +1,12 @@
-use crate::schema::crates;
-use crate::tests::util::TestApp;
-use crate::worker::jobs;
+use crate::util::TestApp;
 use chrono::DateTime;
+use crates_io::schema::crates;
+use crates_io::worker::jobs;
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use insta::assert_snapshot;
+use object_store::ObjectStoreExt;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sync_crates_feed() -> anyhow::Result<()> {
@@ -19,7 +20,7 @@ async fn test_sync_crates_feed() -> anyhow::Result<()> {
     create_crate(&mut conn, "baz", description, "2024-06-21T17:01:33Z").await?;
     create_crate(&mut conn, "quux", None, "2024-06-21T17:03:45Z").await?;
 
-    jobs::rss::SyncCratesFeed.enqueue(&mut conn).await?;
+    jobs::rss::SyncCratesFeed.enqueue(&conn).await?;
 
     app.run_pending_background_jobs().await;
 

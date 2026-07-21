@@ -1,39 +1,40 @@
-import { defer } from '@/e2e/deferred';
 import { expect, test } from '@/e2e/helper';
 import { loadFixtures } from '@crates-io/msw/fixtures';
 import { http, HttpResponse } from 'msw';
 
 test.describe('Acceptance | search', { tag: '@acceptance' }, () => {
   test('searching for "rust"', async ({ page, msw, percy, a11y }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/');
     await page.fill('[data-test-search-input]', 'rust');
-    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Submit' }).click();
+    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Search' }).click();
 
     await expect(page).toHaveURL('/search?q=rust');
     await expect(page).toHaveTitle("Search Results for 'rust' - crates.io: Rust Package Registry");
 
     await expect(page.locator('[data-test-header]')).toHaveText("Search Results for 'rust'");
     await expect(page.locator('[data-test-search-nav]')).toHaveText('Displaying 1-7 of 7 total results');
-    await expect(page.locator('[data-test-search-sort]')).toHaveText(
-      'Sort by Relevance Relevance All-Time Downloads Recent Downloads Recent Updates Newly Added',
-    );
+    await expect(page.locator('[data-test-search-sort] [data-test-current-order]')).toHaveText('Relevance');
     await expect(page.locator('[data-test-crate-row="0"] [data-test-crate-link]')).toHaveText('kinetic-rust');
     await expect(page.locator('[data-test-crate-row="0"] [data-test-version]')).toHaveText('v0.0.16');
+    await expect(page.locator('[data-test-crate-row="0"] [data-test-crate-spec]')).toHaveRole('heading');
 
     await expect(page.locator('[data-test-crate-row="0"] [data-test-description]')).toHaveText(
       'A Kinetic protocol library written in Rust',
     );
-    await expect(page.locator('[data-test-crate-row="0"] [data-test-downloads]')).toHaveText('All-Time: 225');
+    await expect(page.locator('[data-test-crate-row="0"] [data-test-downloads]')).toHaveText(
+      /All-Time\s*Downloads:\s*225/,
+    );
     await expect(page.locator('[data-test-crate-row="0"] [data-test-updated-at]')).toBeVisible();
 
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
     await a11y.audit();
   });
 
   test('searching for "rust" from query', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/search?q=rust');
 
@@ -46,7 +47,7 @@ test.describe('Acceptance | search', { tag: '@acceptance' }, () => {
   });
 
   test('clearing search results', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/search?q=rust');
 
@@ -60,62 +61,89 @@ test.describe('Acceptance | search', { tag: '@acceptance' }, () => {
     await expect(page.locator('[data-test-search-input]')).toHaveValue('');
   });
 
-  test('pressing S key to focus the search bar', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+  test.describe('search input focus behavior', () => {
+    test('pressing S key focuses the search input', async ({ page, msw }) => {
+      await loadFixtures(msw.db);
 
-    await page.goto('/');
+      await page.goto('/');
 
-    const searchInput = page.locator('[data-test-search-input]');
-    await searchInput.blur();
-    await page.keyboard.press('a');
-    await expect(searchInput).not.toBeFocused();
+      let searchInput = page.locator('[data-test-search-input]');
+      await searchInput.blur();
+      await page.keyboard.press('a');
+      await expect(searchInput).not.toBeFocused();
 
-    await searchInput.blur();
-    await page.keyboard.press('s');
-    await expect(page.locator('[data-test-search-input]')).toBeFocused();
+      await searchInput.blur();
+      await page.keyboard.press('s');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
 
-    await searchInput.blur();
-    await page.keyboard.press('s');
-    await expect(page.locator('[data-test-search-input]')).toBeFocused();
+      await searchInput.blur();
+      await page.keyboard.press('s');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
 
-    await searchInput.blur();
-    await page.keyboard.press('S');
-    await expect(page.locator('[data-test-search-input]')).toBeFocused();
+      await searchInput.blur();
+      await page.keyboard.press('S');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
 
-    await searchInput.blur();
-    await page.keyboard.down('Shift');
-    await page.keyboard.press('s');
-    await page.keyboard.up('Shift');
-    await expect(page.locator('[data-test-search-input]')).toBeFocused();
+      await searchInput.blur();
+      await page.keyboard.down('Shift');
+      await page.keyboard.press('s');
+      await page.keyboard.up('Shift');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
+    });
+
+    test('search input stays focused after submitting the search form with Enter', async ({ page, msw }) => {
+      await loadFixtures(msw.db);
+
+      await page.goto('/');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
+
+      await page.keyboard.type('rust');
+      await page.keyboard.press('Enter');
+
+      await expect(page).toHaveURL('/search?q=rust');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
+    });
+
+    test('focus is not stolen when navigating from the front page', async ({ page, msw }) => {
+      let crate = await msw.db.crate.create({ name: 'nanomsg' });
+      await msw.db.version.create({ crate, num: '0.6.1' });
+
+      await page.goto('/');
+      await expect(page.locator('[data-test-search-input]')).toBeFocused();
+
+      await page.click('[data-test-just-updated] [data-test-crate-link="0"]');
+      await expect(page).toHaveURL('/crates/nanomsg/0.6.1');
+      await expect(page.locator('[data-test-search-input]')).not.toBeFocused();
+    });
   });
 
   test('check search results are by default displayed by relevance', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/');
     await page.fill('[data-test-search-input]', 'rust');
-    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Submit' }).click();
+    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Search' }).click();
 
     await expect(page.locator('[data-test-search-sort] [data-test-current-order]')).toHaveText('Relevance');
   });
 
   test('error handling when searching from the frontpage', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({ name: 'rust' });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    let crate = await msw.db.crate.create({ name: 'rust' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     let error = HttpResponse.json({}, { status: 500 });
-    await msw.worker.use(http.get('/api/v1/crates', () => error));
+    msw.worker.use(http.get('/api/v1/crates', () => error));
 
     await page.goto('/');
     await page.fill('[data-test-search-input]', 'rust');
-    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Submit' }).click();
+    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Search' }).click();
     await expect(page.locator('[data-test-crate-row]')).toHaveCount(0);
     await expect(page.locator('[data-test-error-message]')).toBeVisible();
     await expect(page.locator('[data-test-try-again-button]')).toBeEnabled();
 
     await msw.worker.resetHandlers();
-    let deferred = defer();
-    await msw.worker.use(http.get('/api/v1/crates', () => deferred.promise));
+    let deferred = Promise.withResolvers<void>();
+    msw.worker.use(http.get('/api/v1/crates', () => deferred.promise));
 
     await page.click('[data-test-try-again-button]');
     await expect(page.locator('[data-test-page-header] [data-test-spinner]')).toBeVisible();
@@ -130,8 +158,8 @@ test.describe('Acceptance | search', { tag: '@acceptance' }, () => {
   });
 
   test('error handling when searching from the search page', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({ name: 'rust' });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    let crate = await msw.db.crate.create({ name: 'rust' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     await page.goto('/search?q=rust');
     await expect(page.locator('[data-test-crate-row]')).toHaveCount(1);
@@ -139,17 +167,17 @@ test.describe('Acceptance | search', { tag: '@acceptance' }, () => {
     await expect(page.locator('[data-test-try-again-button]')).toHaveCount(0);
 
     let error = HttpResponse.json({}, { status: 500 });
-    await msw.worker.use(http.get('/api/v1/crates', () => error));
+    msw.worker.use(http.get('/api/v1/crates', () => error));
 
     await page.fill('[data-test-search-input]', 'ru');
-    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Submit' }).click();
+    await page.locator('[data-test-search-form]').getByRole('button', { name: 'Search' }).click();
     await expect(page.locator('[data-test-crate-row]')).toHaveCount(0);
     await expect(page.locator('[data-test-error-message]')).toBeVisible();
     await expect(page.locator('[data-test-try-again-button]')).toBeEnabled();
 
     await msw.worker.resetHandlers();
-    let deferred = defer();
-    await msw.worker.use(http.get('/api/v1/crates', () => deferred.promise));
+    let deferred = Promise.withResolvers<void>();
+    msw.worker.use(http.get('/api/v1/crates', () => deferred.promise));
 
     await page.click('[data-test-try-again-button]');
     await expect(page.locator('[data-test-page-header] [data-test-spinner]')).toBeVisible();
@@ -219,7 +247,7 @@ test.describe('Acceptance | search', { tag: '@acceptance' }, () => {
   });
 
   test('visiting without query parameters works', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/search');
 

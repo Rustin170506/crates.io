@@ -1,10 +1,10 @@
-use crate::models::CrateOwner;
-use crate::tests::builders::CrateBuilder;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::CrateBuilder;
+use crate::util::{RequestHelper, TestApp};
+use claims::assert_none;
+use crates_io::models::CrateOwner;
 use crates_io_database::schema::users;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use http::StatusCode;
 use insta::assert_snapshot;
 
 /// See <https://github.com/rust-lang/crates.io/issues/2736>.
@@ -28,7 +28,7 @@ async fn test_issue_2736() -> anyhow::Result<()> {
         .user_id(foo1.as_model().id)
         .created_by(someone_else.as_model().id)
         .build()
-        .insert(&mut conn)
+        .insert(&conn)
         .await?;
 
     // - `foo` deleted their GitHub account (but crates.io has no real knowledge of this)
@@ -46,22 +46,22 @@ async fn test_issue_2736() -> anyhow::Result<()> {
     assert_ne!(github_ids[0], github_ids[1]);
 
     // - The new `foo` account is NOT an owner of the crate
-    let owners = krate.owners(&mut conn).await?;
+    let owners = krate.owners(&conn).await?;
     assert_eq!(owners.len(), 2);
     assert_none!(owners.iter().find(|o| o.id() == foo2.as_model().id));
 
     // Removing an owner, whether it's valid/current or not, should always work (if performed by another valid owner, etc)
     let response = someone_else.remove_named_owner("crate1", "foo").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_snapshot!(response.text(), @r#"{"msg":"owners successfully removed","ok":true}"#);
 
-    let owners = krate.owners(&mut conn).await?;
+    let owners = krate.owners(&conn).await?;
     assert_eq!(owners.len(), 1);
     assert_eq!(owners[0].id(), someone_else.as_model().id);
 
     // Once that removal works, it should be possible to add the new account as an owner
     let response = someone_else.add_named_owner("crate1", "foo").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_snapshot!(response.text(), @r#"{"msg":"user foo has been invited to be an owner of crate crate1","ok":true}"#);
 
     Ok(())

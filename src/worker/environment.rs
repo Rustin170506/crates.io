@@ -1,12 +1,19 @@
 use crate::Emails;
 use crate::cloudfront::CloudFront;
-use crate::fastly::Fastly;
 use crate::storage::Storage;
 use crate::typosquat;
+use crate::worker::jobs::ProcessCloudfrontInvalidationQueue;
 use anyhow::Context;
 use bon::Builder;
+use crates_io_database::models::{CloudFrontDistribution, CloudFrontInvalidationQueueItem};
+use crates_io_docs_rs::DocsRsClient;
+use crates_io_fastly::Fastly;
+use crates_io_github::GitHubClient;
+use crates_io_github_app::GitHubApp;
 use crates_io_index::{Repository, RepositoryConfig};
+use crates_io_og_image::OgImageGenerator;
 use crates_io_team_repo::TeamRepo;
+use crates_io_worker::BackgroundJob;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use object_store::ObjectStore;
@@ -15,12 +22,13 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::OnceCell;
+use tracing::{info, instrument};
 
 #[derive(Builder)]
 pub struct Environment {
     pub config: Arc<crate::config::Server>,
 
-    repository_config: RepositoryConfig,
+    pub repository_config: RepositoryConfig,
     #[builder(skip)]
     repository: Mutex<Option<Repository>>,
     cloudfront: Option<CloudFront>,
@@ -30,6 +38,11 @@ pub struct Environment {
     pub deadpool: Pool<AsyncPgConnection>,
     pub emails: Emails,
     pub team_repo: Box<dyn TeamRepo + Send + Sync>,
+    pub index_sync_github_app: Option<Arc<dyn GitHubApp>>,
+    pub sync_github_app: Option<Arc<dyn GitHubApp>>,
+    pub github: Arc<dyn GitHubClient>,
+    pub docs_rs: Option<Box<dyn DocsRsClient>>,
+    pub og_image_generator: Option<OgImageGenerator>,
 
     /// A lazily initialised cache of the most popular crates ready to use in typosquatting checks.
     #[builder(skip)]
@@ -39,16 +52,21 @@ pub struct Environment {
 impl Environment {
     #[instrument(skip_all)]
     pub fn lock_index(&self) -> anyhow::Result<RepositoryLock<'_>> {
+        let lock_start = Instant::now();
         let mut repo = self.repository.lock();
+        info!(duration = lock_start.elapsed().as_nanos(), "Index locked");
 
         if repo.is_none() {
             info!("Cloning index");
             let clone_start = Instant::now();
 
-            *repo = Some(Repository::open(&self.repository_config)?);
+            // The worker only ever reads the current tip and commits/pushes on
+            // top of it, so a shallow clone is sufficient and avoids fetching
+            // the large index history.
+            *repo = Some(Repository::open_shallow(&self.repository_config)?);
 
             let clone_duration = clone_start.elapsed();
-            info!(duration = ?clone_duration, "Index cloned");
+            info!(duration = clone_duration.as_nanos(), "Index cloned");
         }
 
         let repo_lock = RepositoryLock { repo };
@@ -64,14 +82,32 @@ impl Environment {
         self.fastly.as_ref()
     }
 
-    /// Invalidate a file in all registered CDNs.
-    pub(crate) async fn invalidate_cdns(&self, path: &str) -> anyhow::Result<()> {
-        if let Some(cloudfront) = self.cloudfront() {
-            cloudfront.invalidate(path).await.context("CloudFront")?;
+    /// Invalidates a file in all registered CDNs.
+    pub(crate) async fn invalidate_cdns(
+        &self,
+        conn: &AsyncPgConnection,
+        distribution: CloudFrontDistribution,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        // Queue CloudFront invalidations for batch processing instead of calling directly
+        if self.cloudfront().is_some() {
+            let paths = &[path.to_string()];
+            let result =
+                CloudFrontInvalidationQueueItem::queue_paths(conn, distribution, paths).await;
+            result.context("Failed to queue CloudFront invalidation path")?;
+
+            // Schedule the processing job to handle the queued paths
+            let result = ProcessCloudfrontInvalidationQueue.enqueue(conn).await;
+            result.context("Failed to enqueue CloudFront invalidation processing job")?;
         }
 
-        if let Some(fastly) = self.fastly() {
-            fastly.invalidate(path).await.context("Fastly")?;
+        if let Some(fastly) = self.fastly()
+            && let Some(cdn_domain) = &self.config.storage.cdn_prefix
+        {
+            fastly
+                .purge_both_domains(cdn_domain, path)
+                .await
+                .context("Fastly")?;
         }
 
         Ok(())

@@ -1,5 +1,9 @@
 pub use self::action::{NewVersionOwnerAction, VersionAction, VersionOwnerAction};
+pub use self::cache_tags_backfill::NewCacheTagsBackfillRow;
 pub use self::category::{Category, CrateCategory, NewCategory};
+pub use self::cloudfront_invalidation_queue::{
+    CloudFrontDistribution, CloudFrontInvalidationQueueItem,
+};
 pub use self::crate_owner_invitation::{
     CrateOwnerInvitation, NewCrateOwnerInvitation, NewCrateOwnerInvitationOutcome,
 };
@@ -10,17 +14,20 @@ pub use self::download::VersionDownload;
 pub use self::email::{Email, NewEmail};
 pub use self::follow::Follow;
 pub use self::keyword::{CrateKeyword, Keyword};
-pub use self::krate::{Crate, CrateName, NewCrate, RecentCrateDownloads};
+pub use self::krate::{Crate, CrateName, NewCrate};
 pub use self::owner::{CrateOwner, Owner, OwnerKind};
 pub use self::team::{NewTeam, Team};
 pub use self::token::ApiToken;
-pub use self::user::{NewUser, User};
+pub use self::trustpub::TrustpubData;
+pub use self::user::{NewOauthGithub, NewUser, OauthGithub, User};
 pub use self::version::{NewVersion, TopVersions, Version};
 
 pub mod helpers;
 
 mod action;
+mod cache_tags_backfill;
 pub mod category;
+mod cloudfront_invalidation_queue;
 pub mod crate_owner_invitation;
 pub mod default_versions;
 mod deleted_crate;
@@ -33,5 +40,7 @@ pub mod krate;
 mod owner;
 pub mod team;
 pub mod token;
+pub mod trustpub;
 pub mod user;
 pub mod version;
+pub mod versions_published_by;

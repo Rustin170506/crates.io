@@ -4,12 +4,12 @@
 //! index or cached metadata which was extracted (client side) from the
 //! `Cargo.toml` file.
 
-use axum::Json;
-
 use crate::app::AppState;
 use crate::models::VersionOwnerAction;
 use crate::util::errors::AppResult;
 use crate::views::EncodableVersion;
+use axum::Json;
+use serde::Serialize;
 
 use super::CrateVersionPath;
 
@@ -27,11 +27,11 @@ pub struct GetResponse {
     responses((status = 200, description = "Successful Response", body = inline(GetResponse))),
 )]
 pub async fn find_version(state: AppState, path: CrateVersionPath) -> AppResult<Json<GetResponse>> {
-    let mut conn = state.db_read().await?;
-    let (version, krate) = path.load_version_and_crate(&mut conn).await?;
+    let conn = state.db_read().await?;
+    let (version, krate) = path.load_version_and_crate(&conn).await?;
     let (actions, published_by) = tokio::try_join!(
-        VersionOwnerAction::by_version(&mut conn, &version),
-        version.published_by(&mut conn),
+        VersionOwnerAction::by_version(&conn, &version),
+        version.published_by(&conn),
     )?;
 
     let version = EncodableVersion::from(version, &krate.name, published_by, actions);

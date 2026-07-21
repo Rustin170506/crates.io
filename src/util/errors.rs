@@ -2,12 +2,12 @@
 //!
 //! The suggested usage in returned results is as follows:
 //!
-//! * The concrete `util::concrete::Error` type (re-exported as `util::Error`) is great for code
-//!   that is not part of the request/response lifecycle.  It avoids pulling in the unnecessary
-//!   infrastructure to convert errors into a user facing JSON responses (relative to `AppError`).
+//! * The `anyhow::Error` type is great for code that is not part of the request/response
+//!   lifecycle.  It avoids pulling in the unnecessary infrastructure to convert errors into a user
+//!   facing JSON responses (relative to `AppError`).
 //! * `diesel::QueryResult` - There is a lot of code that only deals with query errors.  If only
 //!   one type of error is possible in a function, using that specific error is preferable to the
-//!   more general `util::Error`.  This is especially common in model code.
+//!   more general `anyhow::Error`.  This is especially common in model code.
 //! * `util::errors::AppResult` - Some failures should be converted into user facing JSON
 //!   responses.  This error type is more dynamic and is box allocated.  Low-level errors are
 //!   typically not converted to user facing errors and most usage is within the models,
@@ -19,13 +19,13 @@ use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 
+use crate::middleware::log_request::ErrorField;
 use axum::Extension;
 use chrono::{DateTime, Utc};
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use http::StatusCode;
 use tokio::task::JoinError;
-
-use crate::middleware::log_request::ErrorField;
+use tracing::error;
 
 mod json;
 
@@ -42,7 +42,7 @@ pub type BoxedAppError = Box<dyn AppError>;
 // (see <https://github.com/rust-lang/cargo/issues/3995>), but Ember requires
 // non-200 response codes for its stores to work properly.
 
-/// Return an error with status 400 and the provided description as JSON
+/// Returns an error with status 400 and the provided description as JSON
 pub fn bad_request<S: ToString>(error: S) -> BoxedAppError {
     custom(StatusCode::BAD_REQUEST, error.to_string())
 }
@@ -88,7 +88,7 @@ pub fn version_not_found(krate: &str, version: &str) -> BoxedAppError {
 // AppError trait
 
 pub trait AppError: Send + fmt::Display + fmt::Debug + 'static {
-    /// Generate an HTTP response for the error
+    /// Generates an HTTP response for the error
     ///
     /// If none is returned, the error will bubble up the middleware stack
     /// where it is eventually logged and turned into a status 500 response.
@@ -164,7 +164,7 @@ impl From<EmailError> for BoxedAppError {
             EmailError::AddressError(error) => Box::new(error),
             EmailError::MessageBuilderError(error) => Box::new(error),
             EmailError::TransportError(error) => {
-                error!(?error, "Failed to send email");
+                error!("Failed to send email: {error}");
                 server_error("Failed to send the email")
             }
         }
@@ -217,7 +217,12 @@ impl From<JoinError> for BoxedAppError {
 impl From<GitHubError> for BoxedAppError {
     fn from(error: GitHubError) -> Self {
         match error {
-            GitHubError::Permission(_) => custom(
+            GitHubError::Unauthorized(_) => custom(
+                StatusCode::UNAUTHORIZED,
+                "It looks like your GitHub session has expired or the token was revoked. \
+                 Please try logging out and logging back in to re-authenticate.",
+            ),
+            GitHubError::Forbidden(_) => custom(
                 StatusCode::FORBIDDEN,
                 "It looks like you don't have permission \
                      to query a necessary property from GitHub \
@@ -229,6 +234,18 @@ impl From<GitHubError> for BoxedAppError {
             GitHubError::NotFound(_) => not_found(),
             _ => internal(format!("didn't get a 200 result from github: {error}")),
         }
+    }
+}
+
+impl From<crates_io_trustpub::github::validation::ValidationError> for BoxedAppError {
+    fn from(error: crates_io_trustpub::github::validation::ValidationError) -> Self {
+        bad_request(error)
+    }
+}
+
+impl From<crates_io_trustpub::gitlab::validation::ValidationError> for BoxedAppError {
+    fn from(error: crates_io_trustpub::gitlab::validation::ValidationError) -> Self {
+        bad_request(error)
     }
 }
 
@@ -280,7 +297,7 @@ mod tests {
 
     #[test]
     fn http_error_responses() {
-        use crate::serde::de::Error;
+        use serde::de::Error;
 
         // Types for handling common error status codes
         assert_eq!(bad_request("").response().status(), StatusCode::BAD_REQUEST);
@@ -305,7 +322,7 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
-            BoxedAppError::from(::std::io::Error::new(::std::io::ErrorKind::Other, ""))
+            BoxedAppError::from(::std::io::Error::other(""))
                 .response()
                 .status(),
             StatusCode::INTERNAL_SERVER_ERROR

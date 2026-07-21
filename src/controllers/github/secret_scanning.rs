@@ -1,25 +1,33 @@
 use crate::app::AppState;
-use crate::email::Email;
+use crate::email::EmailMessage;
 use crate::models::{ApiToken, User};
-use crate::schema::api_tokens;
+use crate::schema::{api_tokens, crate_owners, crates, emails};
 use crate::util::errors::{AppResult, BoxedAppError, bad_request};
 use crate::util::token::HashedToken;
 use anyhow::{Context, anyhow};
 use axum::Json;
 use axum::body::Bytes;
 use base64::{Engine, engine::general_purpose};
-use crates_io_github::GitHubPublicKey;
+use crates_io_database::models::OwnerKind;
+use crates_io_database::schema::trustpub_tokens;
+use crates_io_github::{GitHubAuth, GitHubPublicKey};
+use crates_io_trustpub::access_token::AccessToken;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use futures_util::TryStreamExt;
 use http::HeaderMap;
+use minijinja::context;
 use p256::PublicKey;
 use p256::ecdsa::VerifyingKey;
 use p256::ecdsa::signature::Verifier;
+use serde::{Deserialize, Serialize};
 use serde_json as json;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 // Minimum number of seconds to wait before refreshing cache of GitHub's public keys
 const PUBLIC_KEY_CACHE_LIFETIME: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
@@ -40,7 +48,7 @@ struct GitHubPublicKeyCache {
     timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Check if cache of public keys is populated and not expired
+/// Checks if cache of public keys is populated and not expired
 fn is_cache_valid(timestamp: Option<chrono::DateTime<chrono::Utc>>) -> bool {
     timestamp.is_some_and(|timestamp| chrono::Utc::now() < timestamp + PUBLIC_KEY_CACHE_LIFETIME)
 }
@@ -54,9 +62,11 @@ async fn get_public_keys(state: &AppState) -> Result<Vec<GitHubPublicKey>, Boxed
     }
 
     // Fetch from GitHub API
-    let client_id = &state.config.gh_client_id;
-    let client_secret = state.config.gh_client_secret.secret();
-    let keys = state.github.public_keys(client_id, client_secret).await?;
+    let auth = GitHubAuth::basic(
+        state.config.github_oauth.client_id.as_str(),
+        state.config.github_oauth.client_secret.secret().clone(),
+    );
+    let keys = state.github.public_keys(&auth).await?;
 
     // Populate cache
     cache.keys.clone_from(&keys);
@@ -126,24 +136,55 @@ struct GitHubSecretAlert {
     source: String,
 }
 
-/// Revokes an API token and notifies the token owner
+/// Revokes an API token or Trusted Publishing token and notifies the token owner
 async fn alert_revoke_token(
     state: &AppState,
     alert: &GitHubSecretAlert,
     conn: &mut AsyncPgConnection,
 ) -> QueryResult<GitHubSecretAlertFeedbackLabel> {
+    // First, try to handle as a Trusted Publishing token
+    if let Ok(token) = alert.token.parse::<AccessToken>() {
+        let hashed_token = token.sha256();
+
+        // Delete the token and return crate_ids for notifications
+        let crate_ids = diesel::delete(trustpub_tokens::table)
+            .filter(trustpub_tokens::hashed_token.eq(hashed_token.as_slice()))
+            .returning(trustpub_tokens::crate_ids)
+            .get_result::<Vec<Option<i32>>>(conn)
+            .await
+            .optional()?;
+
+        let Some(crate_ids) = crate_ids else {
+            debug!("Unknown Trusted Publishing token received (false positive)");
+            return Ok(GitHubSecretAlertFeedbackLabel::FalsePositive);
+        };
+
+        warn!("Active Trusted Publishing token received and revoked (true positive)");
+
+        // Send notification emails to all affected crate owners
+        let actual_crate_ids: Vec<i32> = crate_ids.into_iter().flatten().collect();
+        let result = send_trustpub_notification_emails(&actual_crate_ids, alert, state, conn).await;
+        if let Err(error) = result {
+            warn!(
+                "Failed to send trusted publishing token exposure notifications for crates {actual_crate_ids:?}: {error}",
+            );
+        }
+
+        return Ok(GitHubSecretAlertFeedbackLabel::TruePositive);
+    }
+
+    // If not a Trusted Publishing token or not found, try as a regular API token
     let hashed_token = HashedToken::hash(&alert.token);
 
     // Not using `ApiToken::find_by_api_token()` in order to preserve `last_used_at`
-    let token = api_tokens::table
-        .select(ApiToken::as_select())
+    let token = ApiToken::query()
         .filter(api_tokens::token.eq(hashed_token))
-        .get_result::<ApiToken>(conn)
+        .get_result(conn)
         .await
         .optional()?;
 
     let Some(token) = token else {
-        debug!("Unknown API token received (false positive)");
+        debug!("Unknown token received (false positive)");
         return Ok(GitHubSecretAlertFeedbackLabel::FalsePositive);
     };
 
@@ -167,8 +208,8 @@ async fn alert_revoke_token(
 
     if let Err(error) = send_notification_email(&token, alert, state, conn).await {
         warn!(
-            token_id = %token.id, user_id = %token.user_id, ?error,
-            "Failed to send email notification",
+            token_id = %token.id, user_id = %token.user_id,
+            "Failed to send email notification: {error}",
         )
     }
 
@@ -179,7 +220,7 @@ async fn send_notification_email(
     token: &ApiToken,
     alert: &GitHubSecretAlert,
     state: &AppState,
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
 ) -> anyhow::Result<()> {
     let user = User::find(conn, token.user_id)
         .await
@@ -189,57 +230,97 @@ async fn send_notification_email(
         return Err(anyhow!("No address found"));
     };
 
-    let email = TokenExposedEmail {
-        domain: &state.config.domain_name,
-        reporter: "GitHub",
-        source: &alert.source,
-        token_name: &token.name,
-        url: &alert.url,
-    };
+    let email = EmailMessage::from_template(
+        "token_exposed",
+        context! {
+            domain => state.config.domain_name,
+            reporter => "GitHub",
+            source => alert.source,
+            token_name => token.name,
+            url => &alert.url,
+        },
+    )?;
 
     state.emails.send(&recipient, email).await?;
 
     Ok(())
 }
 
-struct TokenExposedEmail<'a> {
-    domain: &'a str,
-    reporter: &'a str,
-    source: &'a str,
-    token_name: &'a str,
-    url: &'a str,
-}
+async fn send_trustpub_notification_emails(
+    crate_ids: &[i32],
+    alert: &GitHubSecretAlert,
+    state: &AppState,
+    mut conn: &AsyncPgConnection,
+) -> anyhow::Result<()> {
+    // Build a mapping from crate_id to crate_name directly from the query
+    let crate_id_to_name: HashMap<i32, String> = crates::table
+        .select((crates::id, crates::name))
+        .filter(crates::id.eq_any(crate_ids))
+        .load_stream::<(i32, String)>(&mut conn)
+        .await?
+        .try_fold(HashMap::new(), |mut map, (id, name)| {
+            map.insert(id, name);
+            std::future::ready(Ok(map))
+        })
+        .await
+        .context("Failed to query crate names")?;
 
-impl Email for TokenExposedEmail<'_> {
-    fn subject(&self) -> String {
-        format!(
-            "crates.io: Your API token \"{}\" has been revoked",
-            self.token_name
-        )
-    }
+    // Then, get all verified owner emails for these crates
+    let owner_emails = crate_owners::table
+        .filter(crate_owners::crate_id.eq_any(crate_ids))
+        .filter(crate_owners::owner_kind.eq(OwnerKind::User)) // OwnerKind::User
+        .filter(crate_owners::deleted.eq(false))
+        .inner_join(emails::table.on(crate_owners::owner_id.eq(emails::user_id)))
+        .filter(emails::verified.eq(true))
+        .select((crate_owners::crate_id, emails::email))
+        .order((emails::email, crate_owners::crate_id))
+        .load::<(i32, String)>(&mut conn)
+        .await
+        .context("Failed to query crate owners")?;
 
-    fn body(&self) -> String {
-        let mut body = format!(
-            "{reporter} has notified us that your crates.io API token {token_name} \
-has been exposed publicly. We have revoked this token as a precaution.
+    // Group by email address to send one notification per user
+    let mut notifications: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-Please review your account at https://{domain} to confirm that no \
-unexpected changes have been made to your settings or crates.
-
-Source type: {source}",
-            domain = self.domain,
-            reporter = self.reporter,
-            source = self.source,
-            token_name = self.token_name,
-        );
-        if self.url.is_empty() {
-            body.push_str("\n\nWe were not informed of the URL where the token was found.");
-        } else {
-            body.push_str(&format!("\n\nURL where the token was found: {}", self.url));
+    for (crate_id, email) in owner_emails {
+        if let Some(crate_name) = crate_id_to_name.get(&crate_id) {
+            notifications
+                .entry(email)
+                .or_default()
+                .insert(crate_name.clone());
         }
-
-        body
     }
+
+    // Send notifications in sorted order by email for consistent testing
+    for (email, crate_names) in notifications {
+        let message = EmailMessage::from_template(
+            "trustpub_token_exposed",
+            context! {
+                domain => state.config.domain_name,
+                reporter => "GitHub",
+                source => alert.source,
+                crate_names,
+                url => alert.url
+            },
+        );
+
+        let Ok(email_template) = message.inspect_err(|error| {
+            warn!(
+                %email, ?crate_names,
+                "Failed to create trusted publishing token exposure email template: {error}"
+            );
+        }) else {
+            continue;
+        };
+
+        if let Err(error) = state.emails.send(&email, email_template).await {
+            warn!(
+                %email, ?crate_names,
+                "Failed to send trusted publishing token exposure notification: {error}"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]

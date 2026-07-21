@@ -1,14 +1,15 @@
 use crate::app::AppState;
-use crate::controllers::helpers::pagination::PaginationOptions;
+use crate::controllers::helpers::pagination::{PaginationOptions, PaginationQueryParams};
 use crate::controllers::krate::CratePath;
-use crate::models::{CrateName, User, Version, VersionOwnerAction};
+use crate::models::{CrateName, ReverseDependency, User, Version, VersionOwnerAction};
 use crate::util::errors::AppResult;
 use crate::views::{EncodableDependency, EncodableVersion};
 use axum::Json;
-use crates_io_database::schema::{crates, users, versions};
+use crates_io_database::schema::{crates, oauth_github, users, versions};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use http::request::Parts;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RevDepsResponse {
@@ -28,11 +29,11 @@ pub struct RevDepsMeta {
     total: i64,
 }
 
-/// List reverse dependencies of a crate.
+/// Lists reverse dependencies of a crate.
 #[utoipa::path(
     get,
     path = "/api/v1/crates/{name}/reverse_dependencies",
-    params(CratePath),
+    params(CratePath, PaginationQueryParams),
     tag = "crates",
     responses((status = 200, description = "Successful Response", body = inline(RevDepsResponse))),
 )]
@@ -43,13 +44,18 @@ pub async fn list_reverse_dependencies(
 ) -> AppResult<Json<RevDepsResponse>> {
     let mut conn = app.db_read().await?;
 
-    let pagination_options = PaginationOptions::builder().gather(&req)?;
+    let pagination_options = PaginationOptions::builder()
+        .limit_page_numbers()
+        .gather(&req)?;
 
-    let krate = path.load_crate(&mut conn).await?;
+    let krate = path.load_crate(&conn).await?;
 
     let offset = pagination_options.offset().unwrap_or_default();
     let limit = pagination_options.per_page;
-    let (rev_deps, total) = krate.reverse_dependencies(&mut conn, offset, limit).await?;
+    let (rev_deps, total) = tokio::try_join!(
+        ReverseDependency::page_for_crate(krate.id, &conn, offset, limit),
+        ReverseDependency::count_for_crate(krate.id, &conn),
+    )?;
 
     let rev_deps: Vec<_> = rev_deps
         .into_iter()
@@ -61,8 +67,9 @@ pub async fn list_reverse_dependencies(
     let versions_and_publishers: Vec<(Version, CrateName, Option<User>)> = versions::table
         .filter(versions::id.eq_any(version_ids))
         .inner_join(crates::table)
-        .left_outer_join(users::table)
+        .left_outer_join(users::table.left_join(oauth_github::table))
         .select(<(Version, CrateName, Option<User>)>::as_select())
+        .order(versions::id)
         .load(&mut conn)
         .await?;
 
@@ -71,7 +78,7 @@ pub async fn list_reverse_dependencies(
         .map(|(v, ..)| v)
         .collect::<Vec<_>>();
 
-    let actions = VersionOwnerAction::for_versions(&mut conn, &versions).await?;
+    let actions = VersionOwnerAction::for_versions(&conn, &versions).await?;
 
     let versions = versions_and_publishers
         .into_iter()

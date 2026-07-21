@@ -1,6 +1,11 @@
 use crate::app::AppState;
 use axum::Json;
 use axum::response::IntoResponse;
+use axum_extra::TypedHeader;
+use axum_extra::headers::CacheControl;
+use crates_io_version::commit;
+use serde::Serialize;
+use std::time::Duration;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct MetadataResponse<'a> {
@@ -12,8 +17,15 @@ pub struct MetadataResponse<'a> {
     #[schema(example = "0aebe2cdfacae1229b93853b1c58f9352195f081")]
     pub commit: &'a str,
 
+    /// CDN base URL that e.g. crate files are served from.
+    #[schema(example = "https://static.crates.io")]
+    pub cdn_base: &'a str,
+
     /// Whether the crates.io service is in read-only mode.
     pub read_only: bool,
+
+    /// Optional banner message to display on all pages.
+    pub banner_message: Option<&'a str>,
 }
 
 /// Get crates.io metadata.
@@ -29,13 +41,22 @@ pub struct MetadataResponse<'a> {
 pub async fn get_site_metadata(state: AppState) -> impl IntoResponse {
     let read_only = state.config.db.are_all_read_only();
 
-    let deployed_sha =
-        dotenvy::var("HEROKU_SLUG_COMMIT").unwrap_or_else(|_| String::from("unknown"));
+    let deployed_sha = commit().ok().flatten();
+    let deployed_sha = deployed_sha.as_deref().unwrap_or("unknown");
 
-    Json(MetadataResponse {
-        deployed_sha: &deployed_sha,
-        commit: &deployed_sha,
-        read_only,
-    })
-    .into_response()
+    let cache_control = CacheControl::new()
+        .with_public()
+        .with_max_age(Duration::from_secs(15));
+
+    (
+        TypedHeader(cache_control),
+        Json(MetadataResponse {
+            deployed_sha,
+            commit: deployed_sha,
+            read_only,
+            banner_message: state.config.banner_message.as_deref(),
+            cdn_base: state.storage.cdn_base(),
+        }),
+    )
+        .into_response()
 }

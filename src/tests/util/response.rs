@@ -1,11 +1,13 @@
-use crate::tests::util::matchers::is_success;
+use crate::util::matchers::is_success;
 use bytes::Bytes;
+use claims::{assert_none, assert_ok, assert_some, assert_some_eq};
 use googletest::prelude::*;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::str::from_utf8;
 
-use crate::rate_limiter::LimitedAction;
+use crates_io::rate_limiter::LimitedAction;
 use derive_more::Deref;
 use http::{StatusCode, header};
 
@@ -22,7 +24,7 @@ impl<T> Response<T>
 where
     for<'de> T: serde::Deserialize<'de>,
 {
-    /// Assert that the response is good and deserialize the message
+    /// Asserts that the response is good and deserializes the message
     #[track_caller]
     pub fn good(self) -> T {
         assert_that!(self.status(), is_success());
@@ -39,7 +41,7 @@ impl<T> Response<T> {
         }
     }
 
-    /// Consume the response body and convert it to a JSON value
+    /// Consumes the response body and converts it to a JSON value
     #[track_caller]
     pub fn json(&self) -> Value {
         json(&self.response)
@@ -60,7 +62,45 @@ impl<T> Response<T> {
         self
     }
 
-    /// Assert that the status code is 429 and that the body matches a rate limit.
+    /// Asserts that the response carries the given `Cache-Control` header value.
+    #[track_caller]
+    pub fn assert_cache_control(&self, expected: &str) -> &Self {
+        let value = assert_some!(self.response.headers().get(header::CACHE_CONTROL));
+        assert_eq!(assert_ok!(value.to_str()), expected);
+        self
+    }
+
+    /// Asserts that no `Cache-Control` header is present, i.e. the response may be
+    /// freely cached by shared caches.
+    #[track_caller]
+    pub fn assert_no_cache_control(&self) -> &Self {
+        assert_none!(self.response.headers().get(header::CACHE_CONTROL));
+        self
+    }
+
+    /// Asserts that the `Vary` header lists exactly the given values, ignoring
+    /// order, case, and how the values are spread across multiple header lines.
+    #[track_caller]
+    pub fn assert_vary(&self, expected: &[&str]) -> &Self {
+        let actual = self
+            .response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .flat_map(|value| assert_ok!(value.to_str()).split(','))
+            .map(|token| token.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
+        let expected = expected
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(actual, expected);
+        self
+    }
+
+    /// Asserts that the status code is 429 and that the body matches a rate limit.
     #[track_caller]
     pub fn assert_rate_limited(self, action: LimitedAction) {
         #[derive(serde::Deserialize)]
@@ -80,20 +120,6 @@ impl<T> Response<T> {
         let error: ErrorResponse = json(&self.response);
         assert_that!(error.errors, len(eq(1)));
         assert_that!(error.errors[0].detail, starts_with(expected_message_start));
-    }
-}
-
-impl Response<()> {
-    /// Assert that the status code is 404
-    #[track_caller]
-    pub fn assert_not_found(&self) {
-        assert_eq!(self.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// Assert that the status code is 403
-    #[track_caller]
-    pub fn assert_forbidden(&self) {
-        assert_eq!(self.status(), StatusCode::FORBIDDEN);
     }
 }
 

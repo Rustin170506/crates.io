@@ -19,16 +19,14 @@ test.describe('Acceptance | /accept-invite/:token', { tag: '@acceptance' }, () =
   test('shows error for unknown token', async ({ page }) => {
     await page.goto('/accept-invite/unknown');
     await expect(page).toHaveURL('/accept-invite/unknown');
-    await expect(page.locator('[data-test-error-message]')).toHaveText(
-      'You may want to visit crates.io/me/pending-invites to try again.',
-    );
+    await expect(page.locator('[data-test-error-message]')).toHaveText('Not Found');
   });
 
   test('shows error for expired token', async ({ page, msw }) => {
     let errorMessage =
       'The invitation to become an owner of the demo_crate crate expired. Please reach out to an owner of the crate to request a new invitation.';
     let error = HttpResponse.json({ errors: [{ detail: errorMessage }] }, { status: 410 });
-    await msw.worker.use(http.put('/api/v1/me/crate_owner_invitations/accept/:token', () => error));
+    msw.worker.use(http.put('/api/v1/me/crate_owner_invitations/accept/:token', () => error));
 
     await page.goto('/accept-invite/secret123');
     await expect(page).toHaveURL('/accept-invite/secret123');
@@ -36,11 +34,11 @@ test.describe('Acceptance | /accept-invite/:token', { tag: '@acceptance' }, () =
   });
 
   test('shows success for known token', async ({ page, msw, percy }) => {
-    let inviter = msw.db.user.create();
-    let invitee = msw.db.user.create();
-    let crate = msw.db.crate.create({ name: 'nanomsg' });
-    msw.db.version.create({ crate });
-    let invite = msw.db.crateOwnerInvitation.create({ crate, invitee, inviter });
+    let inviter = await msw.db.user.create({});
+    let invitee = await msw.db.user.create({});
+    let crate = await msw.db.crate.create({ name: 'nanomsg' });
+    await msw.db.version.create({ crate });
+    let invite = await msw.db.crateOwnerInvitation.create({ crate, invitee, inviter });
 
     await page.goto(`/accept-invite/${invite.token}`);
     await expect(page).toHaveURL(`/accept-invite/${invite.token}`);
@@ -49,5 +47,6 @@ test.describe('Acceptance | /accept-invite/:token', { tag: '@acceptance' }, () =
     );
 
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
   });
 });

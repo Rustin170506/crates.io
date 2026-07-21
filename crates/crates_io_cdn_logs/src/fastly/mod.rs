@@ -4,8 +4,9 @@
 
 mod json;
 
-use crate::paths::parse_path;
 use crate::DownloadsMap;
+use crate::paths::parse_path;
+use crate::user_agent::should_count_user_agent;
 use std::borrow::Cow;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::{debug_span, instrument, warn};
@@ -32,6 +33,11 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
             }
         };
 
+        if json.version() != "1" {
+            warn!("Unsupported log line version: {}", json.version());
+            continue;
+        }
+
         if json.method() != "GET" {
             // Ignore non-GET requests.
             continue;
@@ -39,6 +45,14 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
 
         if json.status() != 200 {
             // Ignore non-200 responses.
+            continue;
+        }
+
+        if json
+            .user_agent()
+            .is_some_and(|ua| !should_count_user_agent(ua))
+        {
+            // Ignore requests from user agents that should not be counted.
             continue;
         }
 
@@ -52,7 +66,10 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
             continue;
         };
 
-        let date = json.date_time().date_naive();
+        let Some(date) = json.date() else {
+            warn!("Failed to parse date `{}`", json.date_time);
+            continue;
+        };
 
         downloads.add(name, version, date);
     }
@@ -72,7 +89,7 @@ fn parse_json(json: &str) -> Result<json::LogLine<'_>, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-/// Deal with paths like `/crates/tikv-jemalloc-sys/tikv-jemalloc-sys-0.5.4%2B5.3.0-patched.crate`.
+/// Deals with paths like `/crates/tikv-jemalloc-sys/tikv-jemalloc-sys-0.5.4%2B5.3.0-patched.crate`.
 ///
 /// Compared to the CloudFront logs, we only need a single round of
 /// percent-decoding here, since JSON has its own escaping rules.
@@ -168,6 +185,36 @@ mod tests {
         assert_debug_snapshot!(downloads, @r"
         DownloadsMap {
             2024-01-16  strsim@0.10.0 .. 1
+        }
+        ");
+    }
+
+    #[tokio::test]
+    async fn test_full_info() {
+        let _guard = enable_tracing_output();
+
+        let mut cursor = Cursor::new(include_bytes!("../../test_data/fastly/full-info.log"));
+        let downloads = assert_ok!(count_downloads(&mut cursor).await);
+
+        assert_debug_snapshot!(downloads, @r"
+        DownloadsMap {
+            2025-10-26  cargo-set-version@0.0.2 .. 1
+            2025-10-26  dashmap@6.1.0 .. 1
+            2025-10-26  gix-packetline@0.19.3 .. 1
+            2025-10-26  gix-refspec@0.30.1 .. 1
+            2025-10-26  http@1.3.1 .. 1
+            2025-10-26  http-body@1.0.1 .. 1
+            2025-10-26  indexmap@2.12.0 .. 1
+            2025-10-26  ipnet@2.11.0 .. 1
+            2025-10-26  libc@0.2.177 .. 1
+            2025-10-26  lru-slab@0.1.2 .. 1
+            2025-10-26  owo-colors@4.2.3 .. 1
+            2025-10-26  parking_lot@0.12.5 .. 1
+            2025-10-26  precis-profiles@0.1.11 .. 1
+            2025-10-26  precis-tools@0.1.8 .. 1
+            2025-10-26  scale-info@2.11.3 .. 1
+            2025-10-26  tinyvec_macros@0.1.1 .. 1
+            2025-10-26  unicode-normalization@0.1.22 .. 1
         }
         ");
     }

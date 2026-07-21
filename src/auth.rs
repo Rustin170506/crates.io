@@ -4,20 +4,71 @@ use crate::middleware::log_request::RequestLogExt;
 use crate::models::token::{CrateScope, EndpointScope};
 use crate::models::{ApiToken, User};
 use crate::util::errors::{
-    AppResult, InsecurelyGeneratedTokenRevoked, account_locked, forbidden, internal,
+    AppResult, BoxedAppError, InsecurelyGeneratedTokenRevoked, account_locked, custom, forbidden,
+    internal,
 };
 use crate::util::token::HashedToken;
+use axum::extract::FromRequestParts;
 use chrono::Utc;
 use crates_io_session::SessionExtension;
 use diesel_async::AsyncPgConnection;
-use http::header;
 use http::request::Parts;
+use http::{StatusCode, header};
+use secrecy::{ExposeSecret, SecretString};
+use tracing::instrument;
+
+pub struct AuthHeader(SecretString);
+
+impl AuthHeader {
+    pub async fn optional_from_request_parts(parts: &Parts) -> Result<Option<Self>, BoxedAppError> {
+        let Some(auth_header) = parts.headers.get(header::AUTHORIZATION) else {
+            return Ok(None);
+        };
+
+        let auth_header = auth_header.to_str().map_err(|_| {
+            let message = "Invalid `Authorization` header: Found unexpected non-ASCII characters";
+            custom(StatusCode::UNAUTHORIZED, message)
+        })?;
+
+        let (scheme, token) = auth_header.split_once(' ').unwrap_or(("", auth_header));
+        if !(scheme.eq_ignore_ascii_case("Bearer") || scheme.is_empty()) {
+            let message = format!(
+                "Invalid `Authorization` header: Found unexpected authentication scheme `{scheme}`"
+            );
+            return Err(custom(StatusCode::UNAUTHORIZED, message));
+        }
+
+        let token = SecretString::from(token.trim_ascii());
+        Ok(Some(AuthHeader(token)))
+    }
+
+    pub async fn from_request_parts(parts: &Parts) -> Result<Self, BoxedAppError> {
+        let auth = Self::optional_from_request_parts(parts).await?;
+        auth.ok_or_else(|| {
+            let message = "Missing `Authorization` header";
+            custom(StatusCode::UNAUTHORIZED, message)
+        })
+    }
+
+    pub fn token(&self) -> &SecretString {
+        &self.0
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for AuthHeader {
+    type Rejection = BoxedAppError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Self::from_request_parts(parts).await
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AuthCheck {
     allow_token: bool,
     endpoint_scope: Option<EndpointScope>,
     crate_name: Option<String>,
+    allow_any_crate_scope: bool,
 }
 
 impl AuthCheck {
@@ -29,6 +80,7 @@ impl AuthCheck {
             allow_token: true,
             endpoint_scope: None,
             crate_name: None,
+            allow_any_crate_scope: false,
         }
     }
 
@@ -38,6 +90,7 @@ impl AuthCheck {
             allow_token: false,
             endpoint_scope: None,
             crate_name: None,
+            allow_any_crate_scope: false,
         }
     }
 
@@ -46,6 +99,7 @@ impl AuthCheck {
             allow_token: self.allow_token,
             endpoint_scope: Some(endpoint_scope),
             crate_name: self.crate_name.clone(),
+            allow_any_crate_scope: self.allow_any_crate_scope,
         }
     }
 
@@ -54,6 +108,20 @@ impl AuthCheck {
             allow_token: self.allow_token,
             endpoint_scope: self.endpoint_scope,
             crate_name: Some(crate_name.to_string()),
+            allow_any_crate_scope: self.allow_any_crate_scope,
+        }
+    }
+
+    /// Allows tokens with any crate scope without specifying a particular crate.
+    ///
+    /// Use this for endpoints that deal with multiple crates at once, where the
+    /// caller will handle crate scope filtering manually.
+    pub fn allow_any_crate_scope(&self) -> Self {
+        Self {
+            allow_token: self.allow_token,
+            endpoint_scope: self.endpoint_scope,
+            crate_name: self.crate_name.clone(),
+            allow_any_crate_scope: true,
         }
     }
 
@@ -120,7 +188,8 @@ impl AuthCheck {
             (Some(token_scopes), _) if token_scopes.is_empty() => true,
 
             // The token has crate scopes, but the endpoint does not deal with crates.
-            (Some(_), None) => false,
+            // However, if allow_any_crate_scope is set, we allow it (caller handles filtering).
+            (Some(_), None) => self.allow_any_crate_scope,
 
             // The token is NOT a legacy token, and the endpoint allows a certain endpoint scope or a legacy token.
             (Some(token_scopes), Some(crate_name)) => token_scopes
@@ -169,6 +238,21 @@ impl Authentication {
             Authentication::Token(token) => &token.user,
         }
     }
+
+    /// Returns an error if the request was authenticated with a legacy API token.
+    ///
+    /// Legacy tokens are tokens without any endpoint scopes. They were created
+    /// before the scoped token feature was introduced.
+    pub fn reject_legacy_tokens(&self) -> AppResult<()> {
+        if let Some(token) = self.api_token()
+            && token.endpoint_scopes.is_none()
+        {
+            return Err(forbidden(
+                "This endpoint cannot be used with legacy API tokens. Use a scoped API token instead.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[instrument(skip_all)]
@@ -203,17 +287,12 @@ async fn authenticate_via_token(
     parts: &Parts,
     conn: &mut AsyncPgConnection,
 ) -> AppResult<Option<TokenAuthentication>> {
-    let maybe_authorization = parts
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-
-    let Some(header_value) = maybe_authorization else {
+    let Some(auth_header) = AuthHeader::optional_from_request_parts(parts).await? else {
         return Ok(None);
     };
 
-    let token =
-        HashedToken::parse(header_value).map_err(|_| InsecurelyGeneratedTokenRevoked::boxed())?;
+    let token = auth_header.token().expose_secret();
+    let token = HashedToken::parse(token).map_err(|_| InsecurelyGeneratedTokenRevoked::boxed())?;
 
     let token = ApiToken::find_by_api_token(conn, &token)
         .await
@@ -243,13 +322,19 @@ async fn authenticate(parts: &Parts, conn: &mut AsyncPgConnection) -> AppResult<
 
     match authenticate_via_cookie(parts, conn).await {
         Ok(None) => {}
-        Ok(Some(auth)) => return Ok(Authentication::Cookie(auth)),
+        Ok(Some(auth)) => {
+            parts.request_log().add("auth_type", "cookie");
+            return Ok(Authentication::Cookie(auth));
+        }
         Err(err) => return Err(err),
     }
 
     match authenticate_via_token(parts, conn).await {
         Ok(None) => {}
-        Ok(Some(auth)) => return Ok(Authentication::Token(auth)),
+        Ok(Some(auth)) => {
+            parts.request_log().add("auth_type", "token");
+            return Ok(Authentication::Token(auth));
+        }
         Err(err) => return Err(err),
     }
 

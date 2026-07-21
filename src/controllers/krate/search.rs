@@ -3,15 +3,19 @@
 use crate::auth::AuthCheck;
 use axum::Json;
 use axum::extract::FromRequestParts;
+use axum_extra::TypedHeader;
 use axum_extra::extract::Query;
+use axum_extra::headers::CacheControl;
 use derive_more::Deref;
+use diesel::alias;
 use diesel::dsl::{InnerJoinQuerySource, LeftJoinQuerySource, exists};
 use diesel::prelude::*;
 use diesel::sql_types::Bool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use diesel_full_text_search::{configuration::TsConfigurationByName, *};
 use http::request::Parts;
-use tracing::Instrument;
+use serde::{Deserialize, Serialize};
+use tracing::{Instrument, info_span};
 use utoipa::IntoParams;
 
 use crate::app::AppState;
@@ -24,8 +28,13 @@ use crate::views::EncodableCrate;
 use crate::controllers::helpers::pagination::{Page, PaginationOptions, PaginationQueryParams};
 use crate::models::krate::ALL_COLUMNS;
 use crate::util::RequestUtils;
+use crate::util::no_store;
 use crate::util::string_excl_null::StringExclNull;
-use crates_io_diesel_helpers::{array_agg, canon_crate_name, lower};
+use crates_io_database::fns::{array_agg, canon_crate_name, lower};
+
+/// The maximum number of crates that are ranked by relevance for a search
+/// query (see [`FilterParams::relevance_candidate_ids`]).
+const RELEVANCE_CANDIDATE_LIMIT: i64 = 1000;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ListResponse {
@@ -56,6 +65,9 @@ pub struct ListMeta {
 /// - Alphabetical listing of crates
 /// - List of crates under a specific owner
 /// - Listing a user's followed crates
+///
+/// When sorting by relevance, only the first 1000 results can be accessed, even
+/// though `meta.total` may report a higher number of matching crates.
 #[utoipa::path(
     get,
     path = "/api/v1/crates",
@@ -72,7 +84,7 @@ pub async fn list_crates(
     app: AppState,
     params: ListQueryParams,
     req: Parts,
-) -> AppResult<Json<ListResponse>> {
+) -> AppResult<(Option<TypedHeader<CacheControl>>, Json<ListResponse>)> {
     // Notes:
     // The different use cases this function covers is handled through passing
     // in parameters in the GET request.
@@ -94,6 +106,11 @@ pub async fn list_crates(
     use seek::*;
 
     let filter_params = FilterParams::from(params, &req, &mut conn).await?;
+
+    // When the results are filtered by the followed crates of the authenticated
+    // user, the response depends on the user's identity and must not be cached.
+    let cache_control = filter_params.auth_user_id.map(|_| no_store());
+
     let sort = filter_params.sort.as_deref();
 
     let selection = (
@@ -116,43 +133,57 @@ pub async fn list_crates(
         .left_join(versions::table.on(default_versions::version_id.eq(versions::id)))
         .select(selection);
 
-    if let Some(q_string) = &filter_params.q_string {
-        if !q_string.is_empty() {
-            let q_string = q_string.as_str();
+    if let Some(q_string) = &filter_params.q_string
+        && !q_string.is_empty()
+    {
+        let q_string = q_string.as_str();
 
-            let sort = sort.unwrap_or("relevance");
+        let sort = sort.unwrap_or("relevance");
 
-            query = query.order(Crate::with_name(q_string).desc());
+        query = query.order(Crate::with_name(q_string).desc());
 
-            if sort == "relevance" {
-                let q =
-                    plainto_tsquery_with_search_config(TsConfigurationByName("english"), q_string);
-                let rank = ts_rank_cd(crates::textsearchable_index_col, q);
-                query = query.select((
-                    ALL_COLUMNS,
-                    Crate::with_name(q_string),
-                    crate_downloads::downloads,
-                    recent_crate_downloads::downloads.nullable(),
-                    rank,
-                    versions::num.nullable(),
-                    versions::yanked.nullable(),
-                    default_versions::num_versions.nullable(),
-                ));
-                seek = Some(Seek::Relevance);
-                query = query.then_order_by(rank.desc())
-            } else {
-                query = query.select((
-                    ALL_COLUMNS,
-                    Crate::with_name(q_string),
-                    crate_downloads::downloads,
-                    recent_crate_downloads::downloads.nullable(),
-                    0_f32.into_sql::<Float>(),
-                    versions::num.nullable(),
-                    versions::yanked.nullable(),
-                    default_versions::num_versions.nullable(),
-                ));
-                seek = Some(Seek::Query);
-            }
+        if sort == "relevance" {
+            // Ranking every crate that matches the query is prohibitively
+            // expensive for short or common terms (see
+            // `relevance_candidate_ids`), so we restrict the ranking to a
+            // bounded set of the most promising candidates. Results beyond this
+            // set are intentionally not reachable when sorting by relevance.
+            let candidate_ids = filter_params
+                .relevance_candidate_ids(&mut conn, RELEVANCE_CANDIDATE_LIMIT)
+                .await?;
+            query = query.filter(crates::id.eq_any(candidate_ids));
+
+            let q = plainto_tsquery_with_search_config(TsConfigurationByName("english"), q_string);
+            let rank = ts_rank_cd(crates::textsearchable_index_col, q);
+            query = query.select((
+                ALL_COLUMNS,
+                Crate::with_name(q_string),
+                crate_downloads::downloads,
+                recent_crate_downloads::downloads.nullable(),
+                rank,
+                versions::num.nullable(),
+                versions::yanked.nullable(),
+                default_versions::num_versions.nullable(),
+            ));
+            seek = Some(Seek::Relevance);
+            // Within equal relevance, prefer the more popular crate. Common
+            // terms produce many ties on `ts_rank_cd`, so without this the top
+            // results would be ordered alphabetically by name.
+            query = query
+                .then_order_by(rank.desc())
+                .then_order_by(recent_crate_downloads::downloads.desc().nulls_last())
+        } else {
+            query = query.select((
+                ALL_COLUMNS,
+                Crate::with_name(q_string),
+                crate_downloads::downloads,
+                recent_crate_downloads::downloads.nullable(),
+                0_f32.into_sql::<Float>(),
+                versions::num.nullable(),
+                versions::yanked.nullable(),
+                default_versions::num_versions.nullable(),
+            ));
+            seek = Some(Seek::Query);
         }
     }
 
@@ -190,11 +221,23 @@ pub async fn list_crates(
 
     let explicit_page = matches!(pagination.page, Page::Numeric(_));
 
+    // When sorting by relevance only the first `RELEVANCE_CANDIDATE_LIMIT`
+    // results are reachable, so reject explicit pages that start beyond it
+    // instead of returning an empty page. Seek pagination needs no equivalent:
+    // it stops handing out keys once it reaches the boundary.
+    if matches!(seek, Some(Seek::Relevance))
+        && let Some(offset) = pagination.offset()
+        && offset >= RELEVANCE_CANDIDATE_LIMIT
+    {
+        return Err(bad_request(format!(
+            "Cannot page beyond the first {RELEVANCE_CANDIDATE_LIMIT} results when sorting by relevance. Please take a look at https://crates.io/data-access for alternatives."
+        )));
+    }
+
     // To avoid breaking existing users, seek-based pagination is only used if an explicit page has
     // not been provided. This way clients relying on meta.next_page will use the faster seek-based
     // paginations, while client hardcoding pages handling will use the slower offset-based code.
-    let (total, next_page, prev_page, data) = if !explicit_page && seek.is_some() {
-        let seek = seek.unwrap();
+    let (total, next_page, prev_page, data) = if !explicit_page && let Some(seek) = seek {
         if let Some(condition) = seek
             .after(&pagination.page)?
             .map(|s| filter_params.seek_after(&s))
@@ -262,14 +305,17 @@ pub async fn list_crates(
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(ListResponse {
-        crates,
-        meta: ListMeta {
-            total,
-            next_page,
-            prev_page,
-        },
-    }))
+    Ok((
+        cache_control,
+        Json(ListResponse {
+            crates,
+            meta: ListMeta {
+                total,
+                next_page,
+                prev_page,
+            },
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize, FromRequestParts, IntoParams)]
@@ -382,17 +428,17 @@ impl FilterParams {
     fn make_query(&self) -> crates::BoxedQuery<'_, diesel::pg::Pg> {
         let mut query = crates::table.into_boxed();
 
-        if let Some(q_string) = &self.q_string {
-            if !q_string.is_empty() {
-                let q = plainto_tsquery_with_search_config(
-                    TsConfigurationByName("english"),
-                    q_string.as_str(),
-                );
-                query = query.filter(
-                    q.matches(crates::textsearchable_index_col)
-                        .or(Crate::loosly_matches_name(q_string.as_str())),
-                );
-            }
+        if let Some(q_string) = &self.q_string
+            && !q_string.is_empty()
+        {
+            let q = plainto_tsquery_with_search_config(
+                TsConfigurationByName("english"),
+                q_string.as_str(),
+            );
+            query = query.filter(
+                q.matches(crates::textsearchable_index_col)
+                    .or(Crate::loosly_matches_name(q_string.as_str())),
+            );
         }
 
         if let Some(cat) = &self.category {
@@ -473,6 +519,35 @@ impl FilterParams {
         }
 
         query
+    }
+
+    /// Returns the ids of the crates to rank by relevance for the search query.
+    ///
+    /// Ranking every match with `ts_rank_cd` is too expensive for short or
+    /// common terms, which match a large fraction of crates each with a large,
+    /// TOAST-ed `tsvector`. Instead we rank only the `limit` matches with the
+    /// most recent downloads, plus any exact name match regardless of its
+    /// download count.
+    async fn relevance_candidate_ids(
+        &self,
+        conn: &mut AsyncPgConnection,
+        limit: i64,
+    ) -> AppResult<Vec<i32>> {
+        let q_string = self.q_string.as_ref().expect("q_string should not be None");
+        let ids = self
+            .make_query()
+            .left_join(recent_crate_downloads::table)
+            .select(crates::id)
+            .order((
+                Crate::with_name(q_string.as_str()).desc(),
+                recent_crate_downloads::downloads.desc().nulls_last(),
+                crates::id,
+            ))
+            .limit(limit)
+            .load::<i32>(conn)
+            .await?;
+
+        Ok(ids)
     }
 
     fn seek_after(&self, seek_payload: &seek::SeekPayload) -> BoxedCondition<'_> {
@@ -606,14 +681,24 @@ impl FilterParams {
             SeekPayload::Relevance(Relevance {
                 exact_match: exact,
                 rank: rank_in,
+                recent_downloads,
                 id,
             }) => {
                 // Equivalent of:
+                // for recent_downloads is not None:
                 // ```
-                // WHERE (exact_match = exact_match' AND rank = rank' AND name > name')
+                // WHERE (exact_match = exact_match' AND rank = rank' AND recent_downloads = recent_downloads' AND name > name')
+                //      OR (exact_match = exact_match' AND rank = rank' AND (recent_downloads < recent_downloads' OR recent_downloads IS NULL))
                 //      OR (exact_match = exact_match' AND rank < rank')
                 //      OR exact_match < exact_match'
-                // ORDER BY exact_match DESC, rank DESC, name ASC
+                // ORDER BY exact_match DESC, rank DESC, recent_downloads DESC NULLS LAST, name ASC
+                // ```
+                // for recent_downloads is None:
+                // ```
+                // WHERE (exact_match = exact_match' AND rank = rank' AND recent_downloads IS NULL AND name > name')
+                //      OR (exact_match = exact_match' AND rank < rank')
+                //      OR exact_match < exact_match'
+                // ORDER BY exact_match DESC, rank DESC, recent_downloads DESC NULLS LAST, name ASC
                 // ```
                 let q_string = self.q_string.as_ref().expect("q_string should not be None");
                 let q = plainto_tsquery_with_search_config(
@@ -622,17 +707,44 @@ impl FilterParams {
                 );
                 let rank = ts_rank_cd(crates::textsearchable_index_col, q);
                 let name_exact_match = Crate::with_name(q_string.as_str());
-                vec![
-                    Box::new(
-                        name_exact_match
-                            .eq(exact)
-                            .and(rank.eq(rank_in))
-                            .and(crates::name.nullable().gt(crate_name_by_id(id)))
-                            .nullable(),
-                    ),
-                    Box::new(name_exact_match.eq(exact).and(rank.lt(rank_in)).nullable()),
+                let downloads = recent_crate_downloads::downloads;
+
+                let mut conditions: Vec<BoxedCondition<'_>> = vec![
                     Box::new(name_exact_match.lt(exact).nullable()),
-                ]
+                    Box::new(name_exact_match.eq(exact).and(rank.lt(rank_in)).nullable()),
+                ];
+                // Break the exact-match/rank tie by recent downloads
+                // (DESC NULLS LAST), then by name.
+                match recent_downloads {
+                    Some(dl) => {
+                        conditions.push(Box::new(
+                            name_exact_match
+                                .eq(exact)
+                                .and(rank.eq(rank_in))
+                                .and(downloads.lt(dl).or(downloads.is_null()))
+                                .nullable(),
+                        ));
+                        conditions.push(Box::new(
+                            name_exact_match
+                                .eq(exact)
+                                .and(rank.eq(rank_in))
+                                .and(downloads.eq(dl))
+                                .and(crates::name.nullable().gt(crate_name_by_id(id)))
+                                .nullable(),
+                        ));
+                    }
+                    None => {
+                        conditions.push(Box::new(
+                            name_exact_match
+                                .eq(exact)
+                                .and(rank.eq(rank_in))
+                                .and(downloads.is_null())
+                                .and(crates::name.nullable().gt(crate_name_by_id(id)))
+                                .nullable(),
+                        ));
+                    }
+                }
+                conditions
             }
         };
 
@@ -687,6 +799,7 @@ mod seek {
             Relevance {
                 exact_match: bool,
                 rank: f32,
+                recent_downloads: Option<i64>,
                 id: i32,
             },
         }
@@ -715,6 +828,7 @@ mod seek {
                 Seek::Relevance => SeekPayload::Relevance(Relevance {
                     exact_match,
                     rank,
+                    recent_downloads,
                     id,
                 }),
             }

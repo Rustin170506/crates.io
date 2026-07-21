@@ -1,9 +1,9 @@
-use crate::tests::builders::{CrateBuilder, PublishBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::{CrateBuilder, PublishBuilder};
+use crate::util::{RequestHelper, TestApp};
+use claims::assert_ok;
 use crates_io_tarball::TarballBuilder;
 use flate2::Compression;
 use googletest::prelude::*;
-use http::StatusCode;
 use insta::{assert_json_snapshot, assert_snapshot};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11,8 +11,8 @@ async fn tarball_between_default_axum_limit_and_max_upload_size() {
     let max_upload_size = 5 * 1024 * 1024;
     let (app, _, _, token) = TestApp::full()
         .with_config(|config| {
-            config.max_upload_size = max_upload_size;
-            config.max_unpack_size = max_upload_size as u64;
+            config.publish_limits.upload_size = max_upload_size;
+            config.publish_limits.unpack_size = max_upload_size as u64;
         })
         .with_token()
         .await;
@@ -45,13 +45,15 @@ async fn tarball_between_default_axum_limit_and_max_upload_size() {
     let body = PublishBuilder::create_publish_body(&json, &tarball);
 
     let response = token.publish_crate(body).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
     });
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/foo/foo-1.1.0.crate
+    crates/foo/foo-1.1.0.zip
+    crates/foo/foo-1.1.0.zip.json
     index/3/f/foo
     rss/crates.xml
     rss/crates/foo.xml
@@ -64,8 +66,8 @@ async fn tarball_bigger_than_max_upload_size() {
     let max_upload_size = 5 * 1024 * 1024;
     let (app, _, _, token) = TestApp::full()
         .with_config(|config| {
-            config.max_upload_size = max_upload_size;
-            config.max_unpack_size = max_upload_size as u64;
+            config.publish_limits.upload_size = max_upload_size;
+            config.publish_limits.unpack_size = max_upload_size as u64;
         })
         .with_token()
         .await;
@@ -90,17 +92,17 @@ async fn tarball_bigger_than_max_upload_size() {
     let body = PublishBuilder::create_publish_body(&json, &tarball);
 
     let response = token.publish_crate(body).await;
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_snapshot!(response.status(), @"413 Payload Too Large");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"max upload size is: 5242880"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn new_krate_gzip_bomb() {
     let (app, _, _, token) = TestApp::full()
         .with_config(|config| {
-            config.max_upload_size = 3000;
-            config.max_unpack_size = 2000;
+            config.publish_limits.upload_size = 3000;
+            config.publish_limits.unpack_size = 2000;
         })
         .with_token()
         .await;
@@ -109,17 +111,17 @@ async fn new_krate_gzip_bomb() {
     let crate_to_publish = PublishBuilder::new("foo", "1.1.0").add_file("foo-1.1.0/a", body);
 
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"uploaded tarball is malformed or too large when decompressed"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn new_krate_too_big() {
     let (app, _, user) = TestApp::full()
         .with_config(|config| {
-            config.max_upload_size = 3000;
-            config.max_unpack_size = 2000;
+            config.publish_limits.upload_size = 3000;
+            config.publish_limits.unpack_size = 2000;
         })
         .with_user()
         .await;
@@ -128,9 +130,9 @@ async fn new_krate_too_big() {
         PublishBuilder::new("foo_big", "1.0.0").add_file("foo_big-1.0.0/big", vec![b'a'; 2000]);
 
     let response = user.publish_crate(builder).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"uploaded tarball is malformed or too large when decompressed"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -148,8 +150,10 @@ async fn new_krate_too_big_but_whitelisted() {
 
     token.publish_crate(crate_to_publish).await.good();
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/foo_whitelist/foo_whitelist-1.1.0.crate
+    crates/foo_whitelist/foo_whitelist-1.1.0.zip
+    crates/foo_whitelist/foo_whitelist-1.1.0.zip.json
     index/fo/o_/foo_whitelist
     rss/crates/foo_whitelist.xml
     rss/updates.xml

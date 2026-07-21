@@ -1,12 +1,12 @@
-use crate::schema::versions;
-use crate::tests::builders::{CrateBuilder, VersionBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
-use crate::views::EncodableVersion;
+use crate::builders::{CrateBuilder, VersionBuilder};
+use crate::util::{RequestHelper, TestApp};
+use crates_io::schema::versions;
+use crates_io::views::EncodableVersion;
 use diesel::{prelude::*, update};
 use diesel_async::RunQueryDsl;
 use googletest::prelude::*;
-use http::StatusCode;
 use insta::{assert_json_snapshot, assert_snapshot};
+use serde::Deserialize;
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -32,10 +32,11 @@ async fn versions() -> anyhow::Result<()> {
         .await?;
 
     let response = anon.get::<()>("/api/v1/crates/foo_versions/versions").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 
     Ok(())
@@ -46,7 +47,7 @@ async fn test_unknown_crate() {
     let (_, anon) = TestApp::init().empty().await;
 
     let response = anon.get::<()>("/api/v1/crates/unknown/versions").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"crate `unknown` does not exist"}]}"#);
 }
 
@@ -408,20 +409,20 @@ async fn invalid_seek_parameter() {
     let response = anon
         .get_with_query::<()>(url, "per_page=1&sort=semver&seek=broken")
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid seek parameter"}]}"#);
 
     // Sort by date
     let response = anon
         .get_with_query::<()>(url, "per_page=1&sort=date&seek=broken")
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid seek parameter"}]}"#);
 
     // broken seek but without per_page parameter should be ok
     // since it's not consider as seek-based pagination
     let response = anon.get_with_query::<()>(url, "seek=broken").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,10 +463,10 @@ async fn page_with_seek<U: RequestHelper>(anon: &U, url: &str) -> (Vec<VersionLi
         if let Some(ref new_url) = resp.meta.next_page {
             assert!(new_url.contains("seek="));
             assert_that!(resp.versions, len(eq(1)));
-            url = Some(format!("{url_without_query}{}", new_url));
+            url = Some(format!("{url_without_query}{new_url}"));
             assert_ne!(resp.meta.total, 0)
         } else {
-            assert_that!(resp.versions, empty());
+            assert_that!(resp.versions, is_empty());
             assert_eq!(resp.meta.total, 0)
         }
         results.push(resp);

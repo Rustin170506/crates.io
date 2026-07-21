@@ -20,11 +20,18 @@ rust_2021_compatibility = "warn"
 unused = "warn"
 
 [workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
 unescaped_backticks = "warn"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
+doc_link_with_quotes = "warn"
+doc_markdown = "warn"
+# The `.then(...).unwrap_or_default()` form is often more compact than the
+# `if`/`else` that rustfmt produces for the equivalent condition.
+obfuscated_if_else = "allow"
 todo = "warn"
+too_long_first_doc_paragraph = "warn"
 
 [package.metadata.cargo-machete]
 ignored = ["astral-tokio-tar"]
@@ -39,6 +46,16 @@ workspace = true
 insta.opt-level = 3
 similar.opt-level = 3
 
+# This improves the performance of the database connection setup in the
+# test suite by building the crypto crates with optimizations.
+block-buffer.opt-level = 3
+crypto-common.opt-level = 3
+digest.opt-level = 3
+generic-array.opt-level = 3
+hmac.opt-level = 3
+postgres-protocol.opt-level = 3
+sha2.opt-level = 3
+
 [profile.release]
 opt-level = 2
 
@@ -46,106 +63,133 @@ opt-level = 2
 name = "crates_io"
 doctest = true
 
+[[test]]
+name = "integration"
+path = "src/tests/mod.rs"
+
 [dependencies]
-anyhow = "=1.0.97"
-astral-tokio-tar = "=0.5.1"
-async-compression = { version = "=0.4.21", default-features = false, features = ["gzip", "tokio"] }
-async-trait = "=0.1.88"
-aws-credential-types = { version = "=1.2.2", features = ["hardcoded-credentials"] }
-aws-ip-ranges = "=0.1068.0"
-aws-sdk-cloudfront = "=1.68.0"
-aws-sdk-sqs = "=1.62.0"
-axum = { version = "=0.8.2", features = ["macros", "matched-path"] }
-axum-extra = { version = "=0.11.0", features = ["erased-json", "query", "typed-header"] }
+anyhow = "=1.0.104"
+astral-tokio-tar = { version = "=0.6.2", default-features = false }
+async-compression = { version = "=0.4.42", default-features = false, features = ["gzip", "tokio"] }
+async-trait = "=0.1.91"
+aws-credential-types = { version = "=1.3.0", features = ["hardcoded-credentials"] }
+# The default `rustls` feature pulls in the legacy hyper 0.14 + rustls 0.21
+# stack via `aws-smithy-runtime/tls-rustls`, which includes the vulnerable
+# `rustls-webpki` v0.101.x. Using only `default-https-client` avoids this by
+# using the modern rustls 0.23 + hyper 1.x stack instead.
+aws-sdk-cloudfront = { version = "=1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "=1.138.1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "=1.103.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+axum = { version = "=0.8.9", features = ["macros", "matched-path"] }
+axum-extra = { version = "=0.12.6", features = ["erased-json", "middleware", "query", "typed-header"] }
 base64 = "=0.22.1"
-bigdecimal = { version = "=0.4.7", features = ["serde"] }
-bon = "=3.4.0"
-cargo-manifest = "=0.19.1"
-colored = "=3.0.0"
+bigdecimal = { version = "=0.4.10", features = ["serde"] }
+bon = "=3.9.3"
+colored = "=3.1.1"
+crates_io_api_types = { path = "crates/crates_io_api_types" }
+crates_io_cargo_toml = { path = "crates/crates_io_cargo_toml" }
 crates_io_cdn_logs = { path = "crates/crates_io_cdn_logs" }
+crates_io_crate_zip = { path = "crates/crates_io_crate_zip" }
+crates_io_datadog = { path = "crates/crates_io_datadog" }
 crates_io_database = { path = "crates/crates_io_database" }
 crates_io_database_dump = { path = "crates/crates_io_database_dump" }
-crates_io_diesel_helpers = { path = "crates/crates_io_diesel_helpers" }
+crates_io_docs_rs = { path = "crates/crates_io_docs_rs" }
+crates_io_encryption = { path = "crates/crates_io_encryption" }
 crates_io_env_vars = { path = "crates/crates_io_env_vars" }
+crates_io_fastly = { path = "crates/crates_io_fastly" }
 crates_io_github = { path = "crates/crates_io_github" }
+crates_io_github_app = { path = "crates/crates_io_github_app" }
 crates_io_index = { path = "crates/crates_io_index" }
+crates_io_linecount = { path = "crates/crates_io_linecount" }
 crates_io_markdown = { path = "crates/crates_io_markdown" }
+crates_io_og_image = "=0.3.1"
 crates_io_pagerduty = { path = "crates/crates_io_pagerduty" }
+crates_io_real_ip = { path = "crates/crates_io_real_ip" }
 crates_io_session = { path = "crates/crates_io_session" }
 crates_io_tarball = { path = "crates/crates_io_tarball" }
 crates_io_team_repo = { path = "crates/crates_io_team_repo" }
+crates_io_trustpub = { path = "crates/crates_io_trustpub" }
+crates_io_validation = { path = "crates/crates_io_validation" }
+crates_io_version = { path = "crates/crates_io_version" }
 crates_io_worker = { path = "crates/crates_io_worker" }
-csv = "=1.3.1"
-chrono = { version = "=0.4.40", default-features = false, features = ["serde"] }
-clap = { version = "=4.5.32", features = ["derive", "env", "unicode", "wrap_help"] }
+csv = "=1.4.0"
+chrono = { version = "=0.4.45", default-features = false, features = ["serde"] }
+clap = { version = "=4.6.3", features = ["derive", "env", "unicode", "wrap_help"] }
 cookie = { version = "=0.18.1", features = ["secure"] }
-deadpool-diesel = { version = "=0.6.1", features = ["postgres", "tracing"] }
-derive_more = { version = "=2.0.1", features = ["deref", "deref_mut", "display"] }
-dialoguer = "=0.11.0"
-diesel = { version = "=2.2.8", features = ["postgres", "serde_json", "chrono", "numeric"] }
-diesel-async = { version = "=0.5.2", features = ["async-connection-wrapper", "deadpool", "postgres"] }
-diesel_full_text_search = "=2.2.0"
-diesel_migrations = { version = "=2.2.0", features = ["postgres"] }
+deadpool-runtime = { version = "=0.3.1", features = ["tokio_1"] }
+derive_more = { version = "=2.1.1", features = ["deref", "deref_mut", "display"] }
+dialoguer = "=0.12.0"
+diesel = { version = "=2.3.11", features = ["postgres", "serde_json", "chrono", "numeric"] }
+diesel-async = { version = "=0.9.2", features = ["async-connection-wrapper", "deadpool", "postgres"] }
+diesel_full_text_search = "=2.3.0"
+diesel_migrations = { version = "=2.3.2", features = ["postgres"] }
 dotenvy = "=0.15.7"
-flate2 = "=1.1.0"
-futures-util = "=0.3.31"
+flate2 = "=1.1.9"
+futures-util = "=0.3.33"
+git2 = "=0.21.0"
 hex = "=0.4.3"
-http = "=1.3.1"
-hyper = { version = "=1.6.0", features = ["client", "http1"] }
-indexmap = { version = "=2.8.0", features = ["serde"] }
-indicatif = "=0.17.11"
-ipnetwork = "=0.21.1"
-json-subscriber = "=0.2.4"
-lettre = { version = "=0.11.15", default-features = false, features = ["file-transport", "smtp-transport", "hostname", "builder", "tokio1", "tokio1-native-tls"] }
-minijinja = { version = "=2.8.0", features = ["loader"] }
-mockall = "=0.13.1"
-moka = { version = "=0.12.10", default-features = false, features = ["future"] }
-native-tls = "=0.2.14"
-oauth2 = "=5.0.0"
-object_store = { version = "=0.12.0", features = ["aws"] }
-p256 = "=0.13.2"
-parking_lot = "=0.12.3"
+http = "=1.4.2"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+indexmap = { version = "=2.14.0", features = ["serde"] }
+indicatif = "=0.18.6"
+json-subscriber = "=0.3.0"
+lettre = { version = "=0.11.22", default-features = false, features = ["file-transport", "smtp-transport", "hostname", "builder", "tokio1", "tokio1-native-tls"] }
+minijinja = { version = "=2.21.0", features = ["loader"] }
+mockall = "=0.15.0"
+moka = { version = "=0.12.15", default-features = false, features = ["future"] }
+native-tls = "=0.2.18"
+oauth2 = { version = "=5.0.0", default-features = false }
+object_store = { version = "=0.14.1", features = ["aws"] }
+p256 = "=0.14.0"
+parking_lot = "=0.12.5"
 paste = "=1.0.15"
-postgres-native-tls = "=0.5.1"
-prometheus = { version = "=0.13.4", default-features = false }
-rand = "=0.9.0"
-reqwest = { version = "=0.12.14", features = ["gzip", "json"] }
-rss = { version = "=2.0.12", default-features = false, features = ["atom"] }
+postgres-native-tls = "=0.5.3"
+prometheus = { version = "=0.14.0", default-features = false }
+rand = "=0.10.2"
+regex = "=1.13.1"
+reqwest = { version = "=0.13.4", features = ["gzip", "json", "stream"] }
+rss = { version = "=2.1.0", default-features = false, features = ["atom"] }
 secrecy = "=0.10.3"
-semver = { version = "=1.0.26", features = ["serde"] }
-sentry = { version = "=0.36.0", features = ["tracing", "tower", "tower-axum-matched-path", "tower-http"] }
-serde = { version = "=1.0.219", features = ["derive"] }
-serde_json = "=1.0.140"
-sha2 = "=0.10.8"
-spdx = "=0.10.8"
-tar = "=0.4.44"
-tempfile = "=3.19.0"
-thiserror = "=2.0.12"
-tikv-jemallocator = { version = "=0.6.0", features = ['unprefixed_malloc_on_supported_platforms', 'profiling'] }
-tokio = { version = "=1.44.1", features = ["net", "signal", "io-std", "io-util", "rt-multi-thread", "macros", "process"]}
-tokio-postgres = "=0.7.13"
-tokio-util = "=0.7.14"
-toml = "=0.8.20"
-tower = "=0.5.2"
-tower-http = { version = "=0.6.2", features = ["add-extension", "fs", "catch-panic", "timeout", "compression-full"] }
-tracing = "=0.1.41"
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter", "json"] }
-typomania = { version = "=0.1.2", default-features = false }
-url = "=2.5.4"
-utoipa = { version = "=5.3.1", features = ["chrono"] }
+semver = { version = "=1.0.28", features = ["serde"] }
+sentry = { version = "=0.48.5", features = ["tracing", "tower", "tower-axum-matched-path", "tower-http"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
+spdx = "=0.13.4"
+tar = { version = "=0.4.46", default-features = false }
+tempfile = "=3.27.0"
+thiserror = "=2.0.19"
+tikv-jemallocator = { version = "=0.7.0", features = ['unprefixed_malloc_on_supported_platforms', 'profiling'] }
+tokio = { version = "=1.53.1", features = ["net", "signal", "io-std", "io-util", "rt-multi-thread", "macros", "process"]}
+tokio-postgres = "=0.7.18"
+tokio-util = "=0.7.18"
+toml = "=1.1.3"
+tower = "=0.5.3"
+tower-http = { version = "=0.7.0", features = ["add-extension", "fs", "catch-panic", "timeout", "compression-full"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
+typomania = { version = "=0.2.0", default-features = false }
+url = "=2.5.8"
+utoipa = { version = "=5.5.0", features = ["chrono"] }
 utoipa-axum = "=0.2.0"
 
 [dev-dependencies]
-bytes = "=1.10.1"
+bytes = "=1.12.1"
+crates_io_docs_rs = { path = "crates/crates_io_docs_rs", features = ["mock"] }
 crates_io_github = { path = "crates/crates_io_github", features = ["mock"] }
+crates_io_github_app = { path = "crates/crates_io_github_app", features = ["mock"] }
 crates_io_index = { path = "crates/crates_io_index", features = ["testing"] }
 crates_io_tarball = { path = "crates/crates_io_tarball", features = ["builder"] }
 crates_io_team_repo = { path = "crates/crates_io_team_repo", features = ["mock"] }
 crates_io_test_db = { path = "crates/crates_io_test_db" }
+crates_io_test_utils = { path = "crates/crates_io_test_utils" }
+crates_io_trustpub = { path = "crates/crates_io_trustpub", features = ["test-helpers"] }
 claims = "=0.8.0"
-diesel = { version = "=2.2.8", features = ["r2d2"] }
-googletest = "=0.13.0"
-insta = { version = "=1.42.2", features = ["glob", "json", "redactions"] }
-regex = "=1.11.1"
-tokio = "=1.44.1"
-zip = { version = "=2.3.0", default-features = false, features = ["deflate"] }
+diesel = { version = "=2.3.11", features = ["r2d2"] }
+googletest = "=0.14.3"
+insta = { version = "=1.48.0", features = ["glob", "json", "redactions"] }
+jsonwebtoken = { version = "=10.4.0", features = ["aws_lc_rs"] }
+quoted_printable = "=0.5.2"
+sentry = { version = "=0.48.5", features = ["test"] }
+tokio = "=1.53.1"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }

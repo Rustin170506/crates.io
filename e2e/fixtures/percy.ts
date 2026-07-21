@@ -1,5 +1,5 @@
-import { Page, TestInfo } from '@playwright/test';
-import { default as percySnapshot } from '@percy/playwright';
+import percySnapshot from '@percy/playwright';
+import { expect, Page, TestInfo } from '@playwright/test';
 
 export class PercyPage {
   constructor(
@@ -13,13 +13,15 @@ export class PercyPage {
   // This implementation maintains the title format used by @percy/ember
   private title(): string {
     // Skip the filename
-    const paths = this.testInfo.titlePath.slice(1);
-    // Add an "e2e" prefix to differentiate the snapshots from the QUnit tests.
-    // This address the visual changes caused by the font not loading in QUnit tests (#9052).
-    return ['e2e'].concat(paths).join(' | ');
+    return this.testInfo.titlePath.slice(1).join(' | ');
   }
 
   async snapshot(options?: Parameters<typeof percySnapshot>[2]) {
+    // Wait for any in-flight loading state to settle before snapshotting,
+    // otherwise spinners can leak into the captured image and produce flaky
+    // visual diffs.
+    await expect(this.page.locator('[data-test-spinner]')).toHaveCount(0);
+
     await percySnapshot(this.page, this.title(), options);
   }
 }

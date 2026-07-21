@@ -1,0 +1,46 @@
+import { createClient } from '@crates-io/api-client';
+import { error } from '@sveltejs/kit';
+
+const DEFAULT_PER_PAGE = 100;
+
+export async function load({ fetch, params, url, depends }) {
+  depends('versions:data');
+
+  let client = createClient({ fetch });
+
+  let crateName = params.crate_id;
+  let sort = url.searchParams.get('sort') ?? 'date';
+  let perPage = Number(url.searchParams.get('per_page')) || DEFAULT_PER_PAGE;
+
+  let response;
+  try {
+    response = await client.GET('/api/v1/crates/{name}/versions', {
+      params: {
+        path: { name: crateName },
+        query: { sort, per_page: perPage, include: 'release_tracks' },
+      },
+    });
+  } catch {
+    // Network errors are treated as `504 Gateway Timeout`
+    loadVersionsError(504);
+  }
+
+  let status = response.response.status;
+  if (response.error) {
+    loadVersionsError(status);
+  }
+
+  let { versions, meta } = response.data;
+  let releaseTracks = meta.release_tracks ?? {};
+
+  return {
+    sort,
+    versions,
+    releaseTracks,
+    nextPage: meta.next_page ?? null,
+  };
+}
+
+function loadVersionsError(status: number): never {
+  error(status, { message: 'Failed to load versions', tryAgain: true });
+}

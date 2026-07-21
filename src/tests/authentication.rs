@@ -1,7 +1,8 @@
-use crate::tests::TestApp;
-use crate::tests::util::{MockRequestExt, RequestHelper, Response};
+use crate::TestApp;
+use crate::util::{MockRequestExt, MockTokenUser, RequestHelper, Response};
 
-use crate::tests::util::encode_session_header;
+use crate::builders::PublishBuilder;
+use crate::util::encode_session_header;
 use http::{Method, StatusCode, header};
 use insta::assert_snapshot;
 
@@ -12,18 +13,18 @@ async fn anonymous_user_unauthorized() {
     let (_, anon) = TestApp::init().empty().await;
     let response: Response<()> = anon.get(URL).await;
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_snapshot!(response.status(), @"403 Forbidden");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"this action requires authentication"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_auth_cannot_find_token() {
-    let (_, anon) = TestApp::init().empty().await;
-    let mut request = anon.request_builder(Method::GET, URL);
-    request.header(header::AUTHORIZATION, "cio1tkfake-token");
-    let response: Response<()> = anon.run(request).await;
+    let (app, _anon) = TestApp::full().empty().await;
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let client = MockTokenUser::with_auth_header("cio1tkfake-token".to_string(), app.clone());
+    let pb = PublishBuilder::new("foo", "1.0.0");
+    let response = client.publish_crate(pb).await;
+    assert_snapshot!(response.status(), @"403 Forbidden");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"authentication failed"}]}"#);
 }
 

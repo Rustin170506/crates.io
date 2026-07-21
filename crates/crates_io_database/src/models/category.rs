@@ -3,12 +3,11 @@ use crate::schema::*;
 use chrono::{DateTime, Utc};
 use diesel::dsl;
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use std::future::Future;
 
-#[derive(Clone, Identifiable, Queryable, QueryableByName, Debug, Selectable)]
-#[diesel(table_name = categories, check_for_backend(diesel::pg::Pg))]
+#[derive(Clone, Identifiable, HasQuery, QueryableByName, Debug)]
+#[diesel(table_name = categories)]
 pub struct Category {
     pub id: i32,
     pub category: String,
@@ -18,7 +17,7 @@ pub struct Category {
     pub created_at: DateTime<Utc>,
 }
 
-type WithSlug<'a> = dsl::Eq<categories::slug, crates_io_diesel_helpers::lower<&'a str>>;
+type WithSlug<'a> = dsl::Eq<categories::slug, crate::fns::lower<Text, &'a str>>;
 
 #[derive(Associations, Insertable, Identifiable, Debug, Clone, Copy)]
 #[diesel(
@@ -35,7 +34,7 @@ pub struct CrateCategory {
 
 impl Category {
     pub fn with_slug(slug: &str) -> WithSlug<'_> {
-        categories::slug.eq(crates_io_diesel_helpers::lower(slug))
+        categories::slug.eq(crate::fns::lower(slug))
     }
 
     #[dsl::auto_type(no_type_alias)]
@@ -49,58 +48,55 @@ impl Category {
         crate_id: i32,
         slugs: &[&str],
     ) -> QueryResult<Vec<String>> {
-        conn.transaction(|conn| {
-            async move {
-                let categories: Vec<Category> = categories::table
-                    .filter(categories::slug.eq_any(slugs))
-                    .load(conn)
-                    .await?;
+        conn.transaction(async |conn| {
+            let categories: Vec<Category> = Category::query()
+                .filter(categories::slug.eq_any(slugs))
+                .load(conn)
+                .await?;
 
-                let invalid_categories = slugs
-                    .iter()
-                    .filter(|s| !categories.iter().any(|c| c.slug == **s))
-                    .map(ToString::to_string)
-                    .collect();
+            let invalid_categories = slugs
+                .iter()
+                .filter(|s| !categories.iter().any(|c| c.slug == **s))
+                .map(ToString::to_string)
+                .collect();
 
-                let crate_categories = categories
-                    .iter()
-                    .map(|c| CrateCategory {
-                        category_id: c.id,
-                        crate_id,
-                    })
-                    .collect::<Vec<_>>();
+            let crate_categories = categories
+                .iter()
+                .map(|c| CrateCategory {
+                    category_id: c.id,
+                    crate_id,
+                })
+                .collect::<Vec<_>>();
 
-                diesel::delete(crates_categories::table)
-                    .filter(crates_categories::crate_id.eq(crate_id))
-                    .execute(conn)
-                    .await?;
+            diesel::delete(crates_categories::table)
+                .filter(crates_categories::crate_id.eq(crate_id))
+                .execute(conn)
+                .await?;
 
-                diesel::insert_into(crates_categories::table)
-                    .values(&crate_categories)
-                    .execute(conn)
-                    .await?;
+            diesel::insert_into(crates_categories::table)
+                .values(&crate_categories)
+                .execute(conn)
+                .await?;
 
-                Ok(invalid_categories)
-            }
-            .scope_boxed()
+            Ok(invalid_categories)
         })
         .await
     }
 
-    pub async fn count_toplevel(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
+    pub async fn count_toplevel(mut conn: &AsyncPgConnection) -> QueryResult<i64> {
         categories::table
             .filter(categories::category.not_like("%::%"))
             .count()
-            .get_result(conn)
+            .get_result(&mut conn)
             .await
     }
 
-    pub fn toplevel(
-        conn: &mut AsyncPgConnection,
+    pub async fn toplevel(
+        mut conn: &AsyncPgConnection,
         sort: &str,
         limit: i64,
         offset: i64,
-    ) -> impl Future<Output = QueryResult<Vec<Category>>> {
+    ) -> QueryResult<Vec<Category>> {
         use diesel::sql_types::Int8;
 
         let sort_sql = match sort {
@@ -113,15 +109,16 @@ impl Category {
         diesel::sql_query(format!(include_str!("toplevel.sql"), sort_sql))
             .bind::<Int8, _>(limit)
             .bind::<Int8, _>(offset)
-            .load(conn)
+            .load(&mut conn)
+            .await
     }
 
-    pub async fn subcategories(&self, conn: &mut AsyncPgConnection) -> QueryResult<Vec<Category>> {
+    pub async fn subcategories(&self, mut conn: &AsyncPgConnection) -> QueryResult<Vec<Category>> {
         use diesel::sql_types::Text;
 
         diesel::sql_query(include_str!("subcategories.sql"))
             .bind::<Text, _>(&self.category)
-            .load(conn)
+            .load(&mut conn)
             .await
     }
 
@@ -131,13 +128,13 @@ impl Category {
     /// offer the frontend, for examples, slugs to create links to each parent category in turn.
     pub async fn parent_categories(
         &self,
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
     ) -> QueryResult<Vec<Category>> {
         use diesel::sql_types::Text;
 
         diesel::sql_query(include_str!("parent_categories.sql"))
             .bind::<Text, _>(&self.slug)
-            .load(conn)
+            .load(&mut conn)
             .await
     }
 }
@@ -184,7 +181,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cats = Category::toplevel(&mut conn, "", 10, 0)
+        let cats = Category::toplevel(&conn, "", 10, 0)
             .await
             .unwrap()
             .into_iter()
@@ -219,7 +216,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cats = Category::toplevel(&mut conn, "crates", 10, 0)
+        let cats = Category::toplevel(&conn, "crates", 10, 0)
             .await
             .unwrap()
             .into_iter()
@@ -255,7 +252,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cats = Category::toplevel(&mut conn, "", 1, 0)
+        let cats = Category::toplevel(&conn, "", 1, 0)
             .await
             .unwrap()
             .into_iter()
@@ -264,7 +261,7 @@ mod tests {
         let expected = vec!["Cat 1".to_string()];
         assert_eq!(expected, cats);
 
-        let cats = Category::toplevel(&mut conn, "", 1, 1)
+        let cats = Category::toplevel(&conn, "", 1, 1)
             .await
             .unwrap()
             .into_iter()
@@ -302,7 +299,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cats = Category::toplevel(&mut conn, "crates", 10, 0)
+        let cats = Category::toplevel(&conn, "crates", 10, 0)
             .await
             .unwrap()
             .into_iter()
@@ -344,7 +341,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cats = Category::toplevel(&mut conn, "crates", 2, 0)
+        let cats = Category::toplevel(&conn, "crates", 2, 0)
             .await
             .unwrap()
             .into_iter()
@@ -353,7 +350,7 @@ mod tests {
         let expected = vec![("Cat 2".to_string(), 12), ("Cat 3".to_string(), 6)];
         assert_eq!(expected, cats);
 
-        let cats = Category::toplevel(&mut conn, "crates", 2, 1)
+        let cats = Category::toplevel(&conn, "crates", 2, 1)
             .await
             .unwrap()
             .into_iter()
@@ -394,12 +391,13 @@ mod tests {
             .unwrap();
 
         let cat: Category = Category::by_slug("cat1::sub1")
+            .select(Category::as_select())
             .first(&mut conn)
             .await
             .unwrap();
 
-        let subcats = cat.subcategories(&mut conn).await.unwrap();
-        let parents = cat.parent_categories(&mut conn).await.unwrap();
+        let subcats = cat.subcategories(&conn).await.unwrap();
+        let parents = cat.parent_categories(&conn).await.unwrap();
 
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].slug, "cat1");

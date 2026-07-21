@@ -1,12 +1,12 @@
-use crate::tests::builders::{CrateBuilder, VersionBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::{CrateBuilder, VersionBuilder};
+use crate::util::{RequestHelper, TestApp};
 use http::StatusCode;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_non_blocked_download_route() {
     let (app, anon, user) = TestApp::init()
         .with_config(|config| {
-            config.blocked_routes.clear();
+            config.block.routes.clear();
         })
         .with_user()
         .await;
@@ -29,9 +29,10 @@ async fn test_non_blocked_download_route() {
 async fn test_blocked_download_route() {
     let (app, anon, user) = TestApp::init()
         .with_config(|config| {
-            config.blocked_routes.clear();
+            config.block.routes.clear();
             config
-                .blocked_routes
+                .block
+                .routes
                 .insert("/api/v1/crates/{name}/{version}/download".into());
         })
         .with_user()

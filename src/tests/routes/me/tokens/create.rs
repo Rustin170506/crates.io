@@ -1,11 +1,11 @@
-use crate::models::ApiToken;
-use crate::models::token::{CrateScope, EndpointScope, NewApiToken};
-use crate::tests::util::insta::{self, assert_json_snapshot};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::util::insta::{self, assert_json_snapshot};
+use crate::util::{RequestHelper, TestApp};
+use claims::assert_ok;
+use crates_io::models::ApiToken;
+use crates_io::models::token::{CrateScope, EndpointScope, NewApiToken};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use googletest::prelude::*;
-use http::StatusCode;
 use insta::assert_snapshot;
 use serde_json::{Value, json};
 
@@ -14,9 +14,8 @@ static NEW_BAR: &[u8] = br#"{ "api_token": { "name": "bar" } }"#;
 #[tokio::test(flavor = "multi_thread")]
 async fn create_token_logged_out() {
     let (_, anon) = TestApp::init().empty().await;
-    anon.put("/api/v1/me/tokens", NEW_BAR)
-        .await
-        .assert_forbidden();
+    let response = anon.put::<()>("/api/v1/me/tokens", NEW_BAR).await;
+    assert_snapshot!(response.status(), @"403 Forbidden");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -24,7 +23,7 @@ async fn create_token_invalid_request() {
     let (app, _, user) = TestApp::init().with_user().await;
     let invalid: &[u8] = br#"{ "name": "" }"#;
     let response = user.put::<()>("/api/v1/me/tokens", invalid).await;
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_snapshot!(response.status(), @"422 Unprocessable Entity");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Failed to deserialize the JSON body into the target type: missing field `api_token` at line 1 column 14"}]}"#);
     assert!(app.emails().await.is_empty());
 }
@@ -34,7 +33,7 @@ async fn create_token_no_name() {
     let (app, _, user) = TestApp::init().with_user().await;
     let empty_name: &[u8] = br#"{ "api_token": { "name": "" } }"#;
     let response = user.put::<()>("/api/v1/me/tokens", empty_name).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"name must have a value"}]}"#);
     assert!(app.emails().await.is_empty());
 }
@@ -42,17 +41,17 @@ async fn create_token_no_name() {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_token_exceeded_tokens_per_user() {
     let (app, _, user) = TestApp::init().with_user().await;
-    let mut conn = app.db_conn().await;
+    let conn = app.db_conn().await;
     let id = user.as_model().id;
 
     for i in 0..1000 {
         let name = format!("token {i}");
         let new_token = NewApiToken::builder().name(name).user_id(id).build();
-        assert_ok!(new_token.insert(&mut conn).await);
+        assert_ok!(new_token.insert(&conn).await);
     }
 
     let response = user.put::<()>("/api/v1/me/tokens", NEW_BAR).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"maximum tokens per user is: 500"}]}"#);
     assert!(app.emails().await.is_empty());
 }
@@ -63,7 +62,7 @@ async fn create_token_success() {
     let mut conn = app.db_conn().await;
 
     let response = user.put::<()>("/api/v1/me/tokens", NEW_BAR).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".api_token.id" => insta::any_id_redaction(),
         ".api_token.created_at" => "[datetime]",
@@ -118,7 +117,7 @@ async fn cannot_create_token_with_token() {
             br#"{ "api_token": { "name": "baz" } }"# as &[u8],
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"cannot use an API token to create a new API token"}]}"#);
     assert!(app.emails().await.is_empty());
 }
@@ -139,7 +138,7 @@ async fn create_token_with_scopes() {
     let response = user
         .put::<()>("/api/v1/me/tokens", serde_json::to_vec(&json).unwrap())
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".api_token.id" => insta::any_id_redaction(),
         ".api_token.created_at" => "[datetime]",
@@ -189,7 +188,7 @@ async fn create_token_with_null_scopes() {
     let response = user
         .put::<()>("/api/v1/me/tokens", serde_json::to_vec(&json).unwrap())
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".api_token.id" => insta::any_id_redaction(),
         ".api_token.created_at" => "[datetime]",
@@ -229,7 +228,7 @@ async fn create_token_with_empty_crate_scope() {
     let response = user
         .put::<()>("/api/v1/me/tokens", serde_json::to_vec(&json).unwrap())
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid crate scope"}]}"#);
     assert!(app.emails().await.is_empty());
 }
@@ -249,7 +248,7 @@ async fn create_token_with_invalid_endpoint_scope() {
     let response = user
         .put::<()>("/api/v1/me/tokens", serde_json::to_vec(&json).unwrap())
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid endpoint scope"}]}"#);
     assert!(app.emails().await.is_empty());
 }
@@ -270,13 +269,81 @@ async fn create_token_with_expiry_date() {
     let response = user
         .put::<()>("/api/v1/me/tokens", serde_json::to_vec(&json).unwrap())
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".api_token.id" => insta::any_id_redaction(),
         ".api_token.created_at" => "[datetime]",
         ".api_token.last_used_at" => "[datetime]",
         ".api_token.token" => insta::api_token_redaction(),
     });
+
+    assert_snapshot!(app.emails_snapshot().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_token_disabled() {
+    const ERROR_MESSAGE: &str =
+        "Token creation is temporarily disabled due to an ongoing phishing campaign";
+
+    let (app, _, user) = TestApp::init()
+        .with_config(|config| {
+            config.disable_token_creation = Some(ERROR_MESSAGE.to_string());
+        })
+        .with_user()
+        .await;
+
+    let response = user.put::<()>("/api/v1/me/tokens", NEW_BAR).await;
+    assert_snapshot!(response.status(), @"503 Service Unavailable");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Token creation is temporarily disabled due to an ongoing phishing campaign"}]}"#);
+    assert!(app.emails().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_token_with_trusted_publishing_scope() {
+    let (app, _, user) = TestApp::init().with_user().await;
+    let mut conn = app.db_conn().await;
+
+    let json = json!({
+        "api_token": {
+            "name": "trusted-publishing-token",
+            "crate_scopes": ["my-crate", "my-*"],
+            "endpoint_scopes": ["trusted-publishing"],
+        }
+    });
+
+    let response = user
+        .put::<()>("/api/v1/me/tokens", serde_json::to_vec(&json).unwrap())
+        .await;
+    assert_snapshot!(response.status(), @"200 OK");
+    assert_json_snapshot!(response.json(), {
+        ".api_token.id" => insta::any_id_redaction(),
+        ".api_token.created_at" => "[datetime]",
+        ".api_token.last_used_at" => "[datetime]",
+        ".api_token.token" => insta::api_token_redaction(),
+    });
+
+    let tokens: Vec<ApiToken> = assert_ok!(
+        ApiToken::belonging_to(user.as_model())
+            .select(ApiToken::as_select())
+            .load(&mut conn)
+            .await
+    );
+
+    assert_that!(tokens, len(eq(1)));
+    assert_eq!(tokens[0].name, "trusted-publishing-token");
+    assert!(!tokens[0].revoked);
+    assert_eq!(tokens[0].last_used_at, None);
+    assert_eq!(
+        tokens[0].crate_scopes,
+        Some(vec![
+            CrateScope::try_from("my-crate").unwrap(),
+            CrateScope::try_from("my-*").unwrap()
+        ])
+    );
+    assert_eq!(
+        tokens[0].endpoint_scopes,
+        Some(vec![EndpointScope::TrustedPublishing])
+    );
 
     assert_snapshot!(app.emails_snapshot().await);
 }

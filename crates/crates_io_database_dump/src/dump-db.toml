@@ -40,6 +40,12 @@ last_retry = "private"
 created_at = "private"
 priority = "private"
 
+[cache_tags_backfills.columns]
+id = "private"
+crate_id = "private"
+crate_name = "private"
+completed_at = "private"
+
 [categories.columns]
 id = "public"
 category = "public"
@@ -48,6 +54,12 @@ description = "public"
 crates_cnt = "public"
 created_at = "public"
 path = "public"
+
+[cloudfront_invalidation_queue.columns]
+id = "private"
+distribution = "private"
+path = "private"
+created_at = "private"
 
 [crate_downloads.columns]
 crate_id = "public"
@@ -87,6 +99,7 @@ textsearchable_index_col = "private" # This Postgres specific and can be derived
 repository = "public"
 max_upload_size = "public"
 max_features = "public"
+trustpub_only = "public"
 
 [crates_categories]
 dependencies = ["categories", "crates"]
@@ -110,13 +123,13 @@ num_versions = "public"
 [deleted_crates]
 dependencies = ["users"]
 [deleted_crates.columns]
-id = "private"
-name = "private"
-created_at = "private"
-deleted_at = "private"
-deleted_by = "private"
-message = "private"
-available_at = "private"
+id = "public"
+name = "public"
+created_at = "public"
+deleted_at = "public"
+deleted_by = "public"
+message = "public"
+available_at = "public"
 
 [dependencies]
 dependencies = ["crates", "versions"]
@@ -157,6 +170,16 @@ created_at = "public"
 [metadata.columns]
 total_downloads = "public"
 
+[oauth_github.columns]
+user_id = "public"
+account_id = "public"
+encrypted_token = "private"
+login = "public"
+avatar = "public"
+last_sync = "private"
+[oauth_github.column_defaults]
+encrypted_token = "''"
+
 [processed_log_files.columns]
 path = "private"
 time = "private"
@@ -180,6 +203,18 @@ rendered_at = "private"
 [reserved_crate_names.columns]
 name = "public"
 
+[reserved_usernames.columns]
+username = "public"
+
+# Derived cache table maintained from `default_versions`/`dependencies`; not
+# part of the public database dump.
+[reverse_dependencies.columns]
+target_crate_id = "private"
+dependent_crate_id = "private"
+version_id = "private"
+dependency_id = "private"
+dependent_downloads = "private"
+
 [teams.columns]
 id = "public"
 login = "public"
@@ -187,6 +222,44 @@ github_id = "public"
 name = "public"
 avatar = "public"
 org_id = "public"
+
+[trustpub_configs_github]
+dependencies = ["crates"]
+[trustpub_configs_github.columns]
+id = "private"
+created_at = "private"
+crate_id = "private"
+repository_owner = "private"
+repository_owner_id = "private"
+repository_name = "private"
+workflow_filename = "private"
+environment = "private"
+
+[trustpub_configs_gitlab]
+dependencies = ["crates"]
+[trustpub_configs_gitlab.columns]
+id = "private"
+created_at = "private"
+crate_id = "private"
+namespace = "private"
+namespace_id = "private"
+project = "private"
+workflow_filepath = "private"
+environment = "private"
+
+[trustpub_tokens.columns]
+id = "private"
+created_at = "private"
+expires_at = "private"
+hashed_token = "private"
+crate_ids = "private"
+trustpub_data = "private"
+
+[trustpub_used_jtis.columns]
+id = "private"
+jti = "private"
+used_at = "private"
+expires_at = "private"
 
 [users]
 filter = """
@@ -197,17 +270,18 @@ id in (
 )"""
 [users.columns]
 id = "public"
-gh_access_token = "private"
 gh_login = "public"
 name = "public"
-gh_avatar = "public"
 gh_id = "public"
+username = "public"
+created_at = "public"
 account_lock_reason = "private"
 account_lock_until = "private"
 is_admin = "private"
 publish_notifications = "private"
+gh_encrypted_token = "private"
 [users.column_defaults]
-gh_access_token = "''"
+gh_encrypted_token = "''"
 
 [version_downloads]
 dependencies = ["versions"]
@@ -233,7 +307,7 @@ id = "public"
 crate_id = "public"
 num = "public"
 num_no_build = "public"
-semver_ord = "private"
+semver_ord_v2 = "private"
 updated_at = "public"
 created_at = "public"
 downloads = "public"
@@ -242,10 +316,12 @@ yanked = "public"
 license = "public"
 crate_size = "public"
 published_by = "public"
-checksum = "public"
+tar_sha256 = "public"
 links = "public"
 rust_version = "public"
 has_lib = "public"
+# The following column is private for now, until we can guarantee a stable data schema.
+lib_name = "private"
 bin_names = "public"
 yank_message = "private"
 edition = "public"
@@ -255,6 +331,12 @@ documentation = "public"
 repository = "public"
 categories = "public"
 keywords = "public"
+# The following column is private for now, until we can guarantee a stable data schema.
+trustpub_data = "private"
+# The following column is private for now, until we can guarantee a stable data schema.
+linecounts = "private"
+zip_sha256 = "public"
+zip_json_sha256 = "public"
 
 [versions_published_by.columns]
 version_id = "private"

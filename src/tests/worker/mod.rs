@@ -1,3 +1,13 @@
+mod archive_index_branch;
+mod build_crate_zip;
+mod generate_og_image;
 mod git;
+mod normalize_index;
+mod readmes;
 mod rss;
+mod send_publish_notifications;
+mod squash_index;
 mod sync_admins;
+mod trustpub;
+mod update_default_version;
+mod update_user_from_github;

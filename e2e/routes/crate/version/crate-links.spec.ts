@@ -2,19 +2,19 @@ import { expect, test } from '@/e2e/helper';
 
 test.describe('Route | crate.version | crate links', { tag: '@routes' }, () => {
   test('shows all external crate links', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({
+    let crate = await msw.db.crate.create({
       name: 'foo',
       homepage: 'https://crates.io/',
       documentation: 'https://doc.rust-lang.org/cargo/getting-started/',
       repository: 'https://github.com/rust-lang/crates.io.git',
     });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     await page.goto('/crates/foo');
 
-    const homepageLink = page.locator('[data-test-homepage-link] a');
-    const docsLink = page.locator('[data-test-docs-link] a');
-    const repositoryLink = page.locator('[data-test-repository-link] a');
+    let homepageLink = page.locator('[data-test-homepage-link] a');
+    let docsLink = page.locator('[data-test-docs-link] a');
+    let repositoryLink = page.locator('[data-test-repository-link] a');
 
     await expect(homepageLink).toHaveText('crates.io');
     await expect(homepageLink).toHaveAttribute('href', 'https://crates.io/');
@@ -27,8 +27,8 @@ test.describe('Route | crate.version | crate links', { tag: '@routes' }, () => {
   });
 
   test('shows no external crate links if none are set', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({ name: 'foo' });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    let crate = await msw.db.crate.create({ name: 'foo' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     await page.goto('/crates/foo');
 
@@ -38,37 +38,37 @@ test.describe('Route | crate.version | crate links', { tag: '@routes' }, () => {
   });
 
   test('hide the homepage link if it is the same as the repository', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({
+    let crate = await msw.db.crate.create({
       name: 'foo',
       homepage: 'https://github.com/rust-lang/crates.io',
       repository: 'https://github.com/rust-lang/crates.io',
     });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     await page.goto('/crates/foo');
 
     await expect(page.locator('[data-test-homepage-link]')).toHaveCount(0);
     await expect(page.locator('[data-test-docs-link]')).toHaveCount(0);
 
-    const repositoryLink = page.locator('[data-test-repository-link] a');
+    let repositoryLink = page.locator('[data-test-repository-link] a');
     await expect(repositoryLink).toHaveText('github.com/rust-lang/crates.io');
     await expect(repositoryLink).toHaveAttribute('href', 'https://github.com/rust-lang/crates.io');
   });
 
   test('hide the homepage link if it is the same as the repository plus `.git`', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({
+    let crate = await msw.db.crate.create({
       name: 'foo',
       homepage: 'https://github.com/rust-lang/crates.io/',
       repository: 'https://github.com/rust-lang/crates.io.git',
     });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     await page.goto('/crates/foo');
 
     await expect(page.locator('[data-test-homepage-link]')).toHaveCount(0);
     await expect(page.locator('[data-test-docs-link]')).toHaveCount(0);
 
-    const repositoryLink = page.locator('[data-test-repository-link] a');
+    let repositoryLink = page.locator('[data-test-repository-link] a');
     await expect(repositoryLink).toHaveText('github.com/rust-lang/crates.io');
     await expect(repositoryLink).toHaveAttribute('href', 'https://github.com/rust-lang/crates.io.git');
   });

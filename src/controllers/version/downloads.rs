@@ -6,6 +6,7 @@ use super::CrateVersionPath;
 use crate::app::AppState;
 use crate::models::VersionDownload;
 use crate::schema::*;
+use crate::storage::StorageKey;
 use crate::util::errors::AppResult;
 use crate::util::{RequestUtils, redirect};
 use crate::views::EncodableVersionDownload;
@@ -17,6 +18,8 @@ use chrono::{Duration, NaiveDate, Utc};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use http::request::Parts;
+use http::{HeaderValue, header};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UrlResponse {
@@ -44,12 +47,20 @@ pub async fn download_version(
     req: Parts,
 ) -> AppResult<Response> {
     let wants_json = req.wants_json();
-    let redirect_url = app.storage.crate_location(&path.name, &path.version);
-    if wants_json {
-        Ok(json!({ "url": redirect_url }).into_response())
+    let key = StorageKey::for_crate_file(&path.name, &path.version);
+    let redirect_url = app.storage.location(&key);
+    let response = if wants_json {
+        json!({ "url": redirect_url }).into_response()
     } else {
-        Ok(redirect(redirect_url))
-    }
+        redirect(redirect_url)
+    };
+
+    // The response body depends on the `Accept` request header.
+    Ok((
+        [(header::VARY, HeaderValue::from_static("accept"))],
+        response,
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize, FromRequestParts, utoipa::IntoParams)]
@@ -82,7 +93,7 @@ pub async fn get_version_downloads(
     params: DownloadsQueryParams,
 ) -> AppResult<Json<DownloadsResponse>> {
     let mut conn = app.db_read().await?;
-    let version = path.load_version(&mut conn).await?;
+    let version = path.load_version(&conn).await?;
 
     let cutoff_end_date = params
         .before_date
@@ -92,6 +103,7 @@ pub async fn get_version_downloads(
 
     let version_downloads = VersionDownload::belonging_to(&version)
         .filter(version_downloads::date.between(cutoff_start_date, cutoff_end_date))
+        .select(VersionDownload::as_select())
         .order(version_downloads::date)
         .load(&mut conn)
         .await?

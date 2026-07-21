@@ -1,11 +1,10 @@
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use secrecy::SecretString;
 
-use crate::models::CrateOwner;
-use crate::schema::{crate_owner_invitations, crates};
+use crate::models::{CrateOwner, User};
+use crate::schema::{crate_owner_invitations, crates, users};
 
 #[derive(Debug)]
 pub enum NewCrateOwnerInvitationOutcome {
@@ -25,7 +24,7 @@ pub struct NewCrateOwnerInvitation {
 impl NewCrateOwnerInvitation {
     pub async fn create(
         &self,
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
     ) -> QueryResult<NewCrateOwnerInvitationOutcome> {
         // Before actually creating the invite, check if an expired invitation already exists
         // and delete it from the database. This allows obtaining a new invite if the old one
@@ -34,7 +33,7 @@ impl NewCrateOwnerInvitation {
             .filter(crate_owner_invitations::invited_user_id.eq(self.invited_user_id))
             .filter(crate_owner_invitations::crate_id.eq(self.crate_id))
             .filter(crate_owner_invitations::expires_at.le(Utc::now()))
-            .execute(conn)
+            .execute(&mut conn)
             .await?;
 
         let res: Option<CrateOwnerInvitation> = diesel::insert_into(crate_owner_invitations::table)
@@ -43,7 +42,8 @@ impl NewCrateOwnerInvitation {
             // already exists. This does not cause problems with expired invitation as those are
             // deleted before doing this INSERT.
             .on_conflict_do_nothing()
-            .get_result(conn)
+            .returning(CrateOwnerInvitation::as_returning())
+            .get_result(&mut conn)
             .await
             .optional()?;
 
@@ -57,7 +57,7 @@ impl NewCrateOwnerInvitation {
 }
 
 /// The model representing a row in the `crate_owner_invitations` database table.
-#[derive(Clone, Debug, Identifiable, Queryable)]
+#[derive(Clone, Debug, Identifiable, HasQuery)]
 #[diesel(primary_key(invited_user_id, crate_id))]
 pub struct CrateOwnerInvitation {
     pub invited_user_id: i32,
@@ -73,51 +73,63 @@ impl CrateOwnerInvitation {
     pub async fn find_by_id(
         user_id: i32,
         crate_id: i32,
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
     ) -> QueryResult<Self> {
-        crate_owner_invitations::table
+        CrateOwnerInvitation::query()
             .find((user_id, crate_id))
-            .first::<Self>(conn)
+            .first(&mut conn)
             .await
     }
 
-    pub async fn find_by_token(token: &str, conn: &mut AsyncPgConnection) -> QueryResult<Self> {
-        crate_owner_invitations::table
+    pub async fn find_by_token(token: &str, mut conn: &AsyncPgConnection) -> QueryResult<Self> {
+        CrateOwnerInvitation::query()
             .filter(crate_owner_invitations::token.eq(token))
-            .first::<Self>(conn)
+            .first(&mut conn)
             .await
     }
 
     pub async fn accept(self, conn: &mut AsyncPgConnection) -> Result<(), AcceptError> {
-        if self.is_expired() {
-            let crate_name: String = crates::table
+        let get_crate_name = async |conn| {
+            crates::table
                 .find(self.crate_id)
                 .select(crates::name)
                 .first(conn)
-                .await?;
+                .await
+        };
 
+        if self.is_expired() {
+            let crate_name = get_crate_name(conn).await?;
             return Err(AcceptError::Expired { crate_name });
         }
 
-        conn.transaction(|conn| {
-            async move {
-                CrateOwner::from_invite(&self).insert(conn).await?;
+        // Get the user and check if they have a verified email
+        let user = User::query()
+            .filter(users::id.eq(self.invited_user_id))
+            .first(conn)
+            .await?;
 
-                diesel::delete(&self).execute(conn).await?;
+        let verified_email = user.verified_email(conn).await?;
+        if verified_email.is_none() {
+            let crate_name = get_crate_name(conn).await?;
+            return Err(AcceptError::EmailNotVerified { crate_name });
+        }
 
-                Ok(())
-            }
-            .scope_boxed()
+        conn.transaction(async |conn| {
+            CrateOwner::from_invite(&self).insert(conn).await?;
+
+            diesel::delete(&self).execute(conn).await?;
+
+            Ok(())
         })
         .await
     }
 
-    pub async fn decline(self, conn: &mut AsyncPgConnection) -> QueryResult<()> {
+    pub async fn decline(self, mut conn: &AsyncPgConnection) -> QueryResult<()> {
         // The check to prevent declining expired invitations is *explicitly* missing. We do not
         // care if an expired invitation is declined, as that just removes the invitation from the
         // database.
 
-        diesel::delete(&self).execute(conn).await?;
+        diesel::delete(&self).execute(&mut conn).await?;
         Ok(())
     }
 
@@ -132,4 +144,6 @@ pub enum AcceptError {
     Diesel(#[from] diesel::result::Error),
     #[error("The invitation has expired")]
     Expired { crate_name: String },
+    #[error("Email verification required")]
+    EmailNotVerified { crate_name: String },
 }

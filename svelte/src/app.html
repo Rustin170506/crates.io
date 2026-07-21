@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="shortcut icon" id="favicon" href="%sveltekit.assets%/favicon.ico" type="image/x-icon" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="crates.io: Rust Package Registry" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="theme-color" content="var(--header-bg-color)" />
+    <link
+      rel="search"
+      href="%sveltekit.assets%/opensearch.xml"
+      type="application/opensearchdescription+xml"
+      title="crates.io"
+    />
+    <meta property="og:title" content="crates.io: Rust Package Registry" />
+    <meta
+      property="og:description"
+      content="crates.io serves as a central registry for sharing crates, which are packages or libraries written in Rust that you can use to enhance your projects"
+    />
+    <meta property="og:image" content="{{ og_image_url }}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <title>crates.io: Rust Package Registry</title>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <noscript>For full functionality of this site it is necessary to enable JavaScript.</noscript>
+    <script>window.onerror=window.onunhandledrejection=function(){document.body.innerHTML='<p style="width: 70%;background: var(--main-bg);padding: 10px;">Sorry, it looks like we were not able to load the page. Please make sure your network connection works and you are using an up-to-date browser. If the issue persists, please visit our <a href="https://github.com/rust-lang/crates.io/issues/new/choose">issue tracker</a> to report the problem.</p>'}</script>
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

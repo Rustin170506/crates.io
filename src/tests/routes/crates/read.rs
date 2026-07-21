@@ -1,5 +1,5 @@
-use crate::tests::builders::{CrateBuilder, PublishBuilder, VersionBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::{CrateBuilder, PublishBuilder, VersionBuilder};
+use crate::util::{RequestHelper, TestApp};
 use diesel_async::RunQueryDsl;
 use http::StatusCode;
 use insta::{assert_json_snapshot, assert_snapshot};
@@ -10,7 +10,7 @@ async fn show() {
     let mut conn = app.db_conn().await;
     let user = user.as_model();
 
-    use crate::schema::versions;
+    use crates_io::schema::versions;
     use diesel::{ExpressionMethods, update};
 
     CrateBuilder::new("foo_show", user.id)
@@ -37,13 +37,14 @@ async fn show() {
         .unwrap();
 
     let response = anon.get::<()>("/api/v1/crates/foo_show").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
         ".keywords[].created_at" => "[datetime]",
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -69,7 +70,7 @@ async fn show_minimal() {
     let response = anon
         .get::<()>("/api/v1/crates/foo_show_minimal?include=")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
@@ -95,13 +96,14 @@ async fn show_all_yanked() {
         .await;
 
     let response = anon.get::<()>("/api/v1/crates/foo_show").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
         ".keywords[].created_at" => "[datetime]",
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -110,8 +112,20 @@ async fn test_missing() {
     let (_, anon) = TestApp::init().empty().await;
 
     let response = anon.get::<()>("/api/v1/crates/missing").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"crate `missing` does not exist"}]}"#);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_null_byte_in_name() {
+    let (_, anon) = TestApp::init().empty().await;
+
+    // A crate name with a null byte can never exist, so instead of letting the
+    // request fail with a database encoding error it should be treated as a
+    // regular "not found" response.
+    let response = anon.get::<()>("/api/v1/crates/foo%00bar").await;
+    assert_snapshot!(response.status(), @"404 Not Found");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"crate `foo\u0000bar` does not exist"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -135,7 +149,7 @@ async fn version_size() {
         .iter()
         .find(|v| v.num == "1.0.0")
         .expect("Could not find v1.0.0");
-    assert_eq!(version1.crate_size, 158);
+    assert_eq!(version1.crate_size, 160);
 
     let version2 = crate_json
         .versions
@@ -144,7 +158,7 @@ async fn version_size() {
         .iter()
         .find(|v| v.num == "2.0.0")
         .expect("Could not find v2.0.0");
-    assert_eq!(version2.crate_size, 184);
+    assert_eq!(version2.crate_size, 192);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -172,7 +186,7 @@ async fn test_new_name() {
         .await;
 
     let response = anon.get::<()>("/api/v1/crates/new?include=").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
@@ -201,12 +215,13 @@ async fn test_include_default_version() {
     let response = anon
         .get::<()>("/api/v1/crates/foo_default_version?include=default_version")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 
     let resp_versions = anon

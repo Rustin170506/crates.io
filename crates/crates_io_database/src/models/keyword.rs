@@ -1,13 +1,12 @@
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
+use crate::fns::lower;
 use crate::models::Crate;
 use crate::schema::*;
-use crates_io_diesel_helpers::lower;
 
-#[derive(Clone, Identifiable, Queryable, Debug, Selectable)]
+#[derive(Clone, Identifiable, HasQuery, Debug)]
 pub struct Keyword {
     pub id: i32,
     pub keyword: String,
@@ -29,15 +28,15 @@ pub struct CrateKeyword {
 }
 
 impl Keyword {
-    pub async fn find_by_keyword(conn: &mut AsyncPgConnection, name: &str) -> QueryResult<Keyword> {
-        keywords::table
+    pub async fn find_by_keyword(mut conn: &AsyncPgConnection, name: &str) -> QueryResult<Keyword> {
+        Keyword::query()
             .filter(keywords::keyword.eq(lower(name)))
-            .first(conn)
+            .first(&mut conn)
             .await
     }
 
     pub async fn find_or_create_all(
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
         names: &[&str],
     ) -> QueryResult<Vec<Keyword>> {
         let lowercase_names: Vec<_> = names.iter().map(|s| s.to_lowercase()).collect();
@@ -50,12 +49,12 @@ impl Keyword {
         diesel::insert_into(keywords::table)
             .values(&new_keywords)
             .on_conflict_do_nothing()
-            .execute(conn)
+            .execute(&mut conn)
             .await?;
 
-        keywords::table
+        Keyword::query()
             .filter(keywords::keyword.eq_any(&lowercase_names))
-            .load(conn)
+            .load(&mut conn)
             .await
     }
 
@@ -74,31 +73,28 @@ impl Keyword {
         crate_id: i32,
         keywords: &[&str],
     ) -> QueryResult<()> {
-        conn.transaction(|conn| {
-            async move {
-                let keywords = Keyword::find_or_create_all(conn, keywords).await?;
+        conn.transaction(async |conn| {
+            let keywords = Keyword::find_or_create_all(conn, keywords).await?;
 
-                diesel::delete(crates_keywords::table)
-                    .filter(crates_keywords::crate_id.eq(crate_id))
-                    .execute(conn)
-                    .await?;
+            diesel::delete(crates_keywords::table)
+                .filter(crates_keywords::crate_id.eq(crate_id))
+                .execute(conn)
+                .await?;
 
-                let crate_keywords = keywords
-                    .into_iter()
-                    .map(|kw| CrateKeyword {
-                        crate_id,
-                        keyword_id: kw.id,
-                    })
-                    .collect::<Vec<_>>();
+            let crate_keywords = keywords
+                .into_iter()
+                .map(|kw| CrateKeyword {
+                    crate_id,
+                    keyword_id: kw.id,
+                })
+                .collect::<Vec<_>>();
 
-                diesel::insert_into(crates_keywords::table)
-                    .values(&crate_keywords)
-                    .execute(conn)
-                    .await?;
+            diesel::insert_into(crates_keywords::table)
+                .values(&crate_keywords)
+                .execute(conn)
+                .await?;
 
-                Ok(())
-            }
-            .scope_boxed()
+            Ok(())
         })
         .await
     }
@@ -124,9 +120,7 @@ mod tests {
             .await
             .unwrap();
 
-        let associated = Keyword::find_or_create_all(&mut conn, &["no"])
-            .await
-            .unwrap();
+        let associated = Keyword::find_or_create_all(&conn, &["no"]).await.unwrap();
         assert_eq!(associated.len(), 1);
         assert_eq!(associated.iter().next().unwrap().keyword, "no");
     }

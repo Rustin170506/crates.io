@@ -1,6 +1,7 @@
 pub mod helpers;
 pub mod util;
 
+pub mod admin;
 pub mod category;
 pub mod crate_owner_invitation;
 pub mod git;
@@ -13,5 +14,6 @@ pub mod site_metadata;
 pub mod summary;
 pub mod team;
 pub mod token;
+pub mod trustpub;
 pub mod user;
 pub mod version;

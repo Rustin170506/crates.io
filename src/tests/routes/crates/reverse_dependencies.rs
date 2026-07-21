@@ -1,6 +1,5 @@
-use crate::tests::builders::{CrateBuilder, VersionBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
-use http::StatusCode;
+use crate::builders::{CrateBuilder, VersionBuilder};
+use crate::util::{RequestHelper, TestApp};
 use insta::{assert_json_snapshot, assert_snapshot};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -26,20 +25,22 @@ async fn reverse_dependencies() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 
     // c1 has no dependent crates.
     let response = anon
         .get::<()>("/api/v1/crates/c2/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -63,10 +64,11 @@ async fn reverse_dependencies_when_old_version_doesnt_depend_but_new_does() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -90,10 +92,11 @@ async fn reverse_dependencies_when_old_version_depended_but_new_doesnt() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -122,10 +125,11 @@ async fn prerelease_versions_not_included_in_reverse_dependencies() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -149,13 +153,14 @@ async fn yanked_versions_not_included_in_reverse_dependencies() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 
-    use crate::schema::versions;
+    use crates_io::schema::versions;
     use diesel::{ExpressionMethods, QueryDsl};
     use diesel_async::RunQueryDsl;
 
@@ -168,10 +173,11 @@ async fn yanked_versions_not_included_in_reverse_dependencies() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -181,7 +187,7 @@ async fn reverse_dependencies_includes_published_by_user_when_present() {
     let mut conn = app.db_conn().await;
     let user = user.as_model();
 
-    use crate::schema::versions;
+    use crates_io::schema::versions;
     use diesel::{ExpressionMethods, update};
     use diesel_async::RunQueryDsl;
 
@@ -190,6 +196,7 @@ async fn reverse_dependencies_includes_published_by_user_when_present() {
         .expect_build(&mut conn)
         .await;
     CrateBuilder::new("c2", user.id)
+        .downloads(100)
         .version(VersionBuilder::new("2.0.0").dependency(&c1, None))
         .expect_build(&mut conn)
         .await;
@@ -205,6 +212,7 @@ async fn reverse_dependencies_includes_published_by_user_when_present() {
 
     // c3's version will have the published by info recorded
     CrateBuilder::new("c3", user.id)
+        .downloads(10)
         .version(VersionBuilder::new("3.0.0").dependency(&c1, None))
         .expect_build(&mut conn)
         .await;
@@ -212,10 +220,11 @@ async fn reverse_dependencies_includes_published_by_user_when_present() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
 }
 
@@ -241,11 +250,38 @@ async fn reverse_dependencies_query_supports_u64_version_number_parts() {
     let response = anon
         .get::<()>("/api/v1/crates/c1/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".versions[].created_at" => "[datetime]",
         ".versions[].updated_at" => "[datetime]",
+        ".versions[].published_by.created_at" => "[datetime]",
     });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reverse_dependencies_blocks_high_page_numbers() {
+    let (app, anon, user) = TestApp::init()
+        .with_config(|config| {
+            config.max_allowed_page_offset = 1;
+        })
+        .with_user()
+        .await;
+
+    let mut conn = app.db_conn().await;
+    let user = user.as_model();
+
+    CrateBuilder::new("c1", user.id)
+        .expect_build(&mut conn)
+        .await;
+
+    let response = anon
+        .get_with_query::<()>(
+            "/api/v1/crates/c1/reverse_dependencies",
+            "page=2&per_page=1",
+        )
+        .await;
+    assert_snapshot!(response.status(), @"400 Bad Request");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Page 2 is unavailable for performance reasons. Please take a look at https://crates.io/data-access for alternatives."}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -255,6 +291,6 @@ async fn test_unknown_crate() {
     let response = anon
         .get::<()>("/api/v1/crates/unknown/reverse_dependencies")
         .await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"crate `unknown` does not exist"}]}"#);
 }

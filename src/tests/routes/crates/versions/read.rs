@@ -1,8 +1,9 @@
-use crate::tests::builders::{CrateBuilder, VersionBuilder};
-use crate::tests::util::insta::{self, assert_json_snapshot};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::{CrateBuilder, VersionBuilder};
+use crate::util::insta::{self, assert_json_snapshot};
+use crate::util::{RequestHelper, TestApp};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use http::StatusCode;
 use serde_json::Value;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -28,12 +29,13 @@ async fn show_by_crate_name_and_version() {
         ".version.created_at" => "[datetime]",
         ".version.updated_at" => "[datetime]",
         ".version.published_by.id" => insta::id_redaction(user.id),
+        ".version.published_by.created_at" => "[datetime]",
     });
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn show_by_crate_name_and_semver_no_published_by() {
-    use crate::schema::versions;
+    use crates_io::schema::versions;
     use diesel::update;
 
     let (app, anon, user) = TestApp::init().with_user().await;
@@ -62,4 +64,47 @@ async fn show_by_crate_name_and_semver_no_published_by() {
         ".version.created_at" => "[datetime]",
         ".version.updated_at" => "[datetime]",
     });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn block_bad_version_urls() {
+    use crates_io::schema::versions;
+    use diesel::{ExpressionMethods, update};
+
+    let (app, anon, user) = TestApp::init().with_user().await;
+    let mut conn = app.db_conn().await;
+    let user = user.as_model();
+
+    let _krate = CrateBuilder::new("foo_bad_version_urls", user.id)
+        .version(VersionBuilder::new("1.0.0"))
+        .expect_build(&mut conn)
+        .await;
+
+    update(versions::table)
+        .filter(versions::num.eq("1.0.0"))
+        .set((
+            versions::homepage.eq(Some("http://rust-ci.org/foo/homepage")),
+            versions::documentation.eq(Some("http://rust-ci.org/foo/docs")),
+            versions::repository.eq(Some("http://rust-ci.org/foo/repo")),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let url = "/api/v1/crates/foo_bad_version_urls/1.0.0";
+    let json: Value = anon.get(url).await.good();
+    assert_eq!(json["version"]["homepage"], Value::Null);
+    assert_eq!(json["version"]["documentation"], Value::Null);
+    assert_eq!(json["version"]["repository"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_null_byte_in_crate_name() {
+    let (_, anon) = TestApp::init().empty().await;
+
+    // A crate name with a null byte can never exist, so instead of letting the
+    // request fail with a database encoding error it should be treated as a
+    // regular "not found" response.
+    let response = anon.get::<()>("/api/v1/crates/foo%00bar/1.0.0").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

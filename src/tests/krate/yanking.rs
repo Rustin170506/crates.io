@@ -1,21 +1,21 @@
-use crate::rate_limiter::LimitedAction;
-use crate::schema::publish_limit_buckets;
-use crate::tests::VersionResponse;
-use crate::tests::builders::PublishBuilder;
-use crate::tests::routes::crates::versions::yank_unyank::YankRequestHelper;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::VersionResponse;
+use crate::builders::PublishBuilder;
+use crate::routes::crates::versions::yank_unyank::YankRequestHelper;
+use crate::util::{RequestHelper, TestApp};
 use chrono::Utc;
+use claims::assert_some_eq;
+use crates_io::rate_limiter::LimitedAction;
+use crates_io::schema::publish_limit_buckets;
 use diesel::ExpressionMethods;
 use diesel_async::RunQueryDsl;
 use googletest::prelude::*;
-use http::StatusCode;
 use insta::{assert_json_snapshot, assert_snapshot};
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(unknown_lints, clippy::bool_assert_comparison)] // for claim::assert_some_eq! with bool
 async fn yank_works_as_intended() {
-    let (app, anon, cookie, token) = TestApp::full().with_token().await;
+    let (app, anon, cookie, token) = TestApp::full().with_git_index().with_token().await;
 
     // Upload a new crate, putting it in the git index
     let crate_to_publish = PublishBuilder::new("fyk", "1.0.0");
@@ -80,6 +80,7 @@ fn check_yanked(app: &TestApp, is_yanked: bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn yank_ratelimit_hit() {
     let (app, _, _, token) = TestApp::full()
+        .with_git_index()
         .with_rate_limit(LimitedAction::YankUnyank, Duration::from_millis(500), 1)
         .with_token()
         .await;
@@ -117,6 +118,7 @@ async fn yank_ratelimit_hit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn yank_ratelimit_expires() {
     let (app, _, _, token) = TestApp::full()
+        .with_git_index()
         .with_rate_limit(LimitedAction::YankUnyank, Duration::from_millis(500), 1)
         .with_token()
         .await;
@@ -248,7 +250,9 @@ async fn patch_version_yank_unyank() {
         assert_json_snapshot!(json, {
             ".version.created_at" => "[datetime]",
             ".version.updated_at" => "[datetime]",
+            ".version.published_by.created_at" => "[datetime]",
             ".version.audit_actions[].time" => "[datetime]",
+            ".version.audit_actions[].user.created_at" => "[datetime]",
         });
     };
 
@@ -286,13 +290,13 @@ async fn patch_version_yank_unyank() {
     let response = token
         .update_yank_status("patchable", "1.0.0", None, Some("Invalid message"))
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Cannot update yank message for a version that is not yanked"}]}"#);
 
     // Attempt to unyank with message (should fail)
     let response = token
         .update_yank_status("patchable", "1.0.0", Some(false), Some("Invalid message"))
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Cannot set yank message when unyanking"}]}"#);
 }

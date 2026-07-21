@@ -1,13 +1,14 @@
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Router};
 use http::{Method, StatusCode};
+use std::sync::Arc;
 use utoipa_axum::routes;
 
 use crate::Env;
 use crate::app::AppState;
 use crate::controllers::*;
-use crate::openapi::BaseOpenApi;
+use crate::openapi::{self, BaseOpenApi};
 use crate::util::errors::not_found;
 
 #[allow(deprecated)]
@@ -31,6 +32,7 @@ pub fn build_axum_router(state: AppState) -> Router<()> {
         // Routes used by the frontend
         .routes(routes!(
             krate::metadata::find_crate,
+            krate::update::update_crate,
             krate::delete::delete_crate
         ))
         .routes(routes!(
@@ -40,6 +42,7 @@ pub fn build_axum_router(state: AppState) -> Router<()> {
         .routes(routes!(version::readme::get_version_readme))
         .routes(routes!(version::dependencies::get_version_dependencies))
         .routes(routes!(version::downloads::get_version_downloads))
+        .routes(routes!(version::docs::rebuild_version_docs))
         .routes(routes!(version::authors::get_version_authors))
         .routes(routes!(krate::downloads::get_crate_downloads))
         .routes(routes!(krate::versions::list_versions))
@@ -87,11 +90,28 @@ pub fn build_axum_router(state: AppState) -> Router<()> {
         .routes(routes!(session::begin_session))
         .routes(routes!(session::authorize_session))
         .routes(routes!(session::end_session))
+        // OIDC / Trusted Publishing
+        .routes(routes!(
+            trustpub::tokens::exchange::exchange_trustpub_token,
+            trustpub::tokens::revoke::revoke_trustpub_token
+        ))
+        .routes(routes!(
+            trustpub::github_configs::create::create_trustpub_github_config,
+            trustpub::github_configs::delete::delete_trustpub_github_config,
+            trustpub::github_configs::list::list_trustpub_github_configs,
+        ))
+        .routes(routes!(
+            trustpub::gitlab_configs::create::create_trustpub_gitlab_config,
+            trustpub::gitlab_configs::delete::delete_trustpub_gitlab_config,
+            trustpub::gitlab_configs::list::list_trustpub_gitlab_configs,
+        ))
         .split_for_parts();
 
     let mut router = router
         // Metrics
         .route("/api/private/metrics/{kind}", get(metrics::prometheus))
+        // Listing a user's crates for admin/support purposes
+        .route("/api/private/admin_list/{username}", get(admin::list))
         // Alerts from GitHub scanning for exposed API tokens
         .route(
             "/api/github/secret-scanning/verify",
@@ -110,7 +130,10 @@ pub fn build_axum_router(state: AppState) -> Router<()> {
     }
 
     router
-        .route("/api/openapi.json", get(async || Json(openapi)))
+        .route(
+            "/api/openapi.json",
+            get(openapi::handler).layer(Extension(Arc::new(openapi))),
+        )
         .fallback(async |method: Method| match method {
             Method::HEAD => StatusCode::NOT_FOUND.into_response(),
             _ => not_found().into_response(),

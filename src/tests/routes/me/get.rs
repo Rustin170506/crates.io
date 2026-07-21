@@ -1,10 +1,10 @@
-use crate::tests::builders::CrateBuilder;
-use crate::tests::util::{RequestHelper, TestApp};
-use crate::views::{EncodablePrivateUser, OwnedCrate};
-use http::StatusCode;
+use crate::builders::CrateBuilder;
+use crate::util::{RequestHelper, TestApp};
+use crates_io::views::{EncodablePrivateUser, OwnedCrate};
 use insta::{assert_json_snapshot, assert_snapshot};
+use serde::Deserialize;
 
-impl crate::tests::util::MockCookieUser {
+impl crate::util::MockCookieUser {
     pub async fn show_me(&self) -> UserShowPrivateResponse {
         let url = "/api/v1/me";
         self.get(url).await.good()
@@ -23,20 +23,24 @@ async fn me() {
     let mut conn = app.db_conn().await;
 
     let response = anon.get::<()>("/api/v1/me").await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_snapshot!(response.status(), @"403 Forbidden");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"this action requires authentication"}]}"#);
 
     let response = user.get::<()>("/api/v1/me").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_json_snapshot!(response.json());
+    assert_snapshot!(response.status(), @"200 OK");
+    assert_json_snapshot!(response.json(), {
+        ".user.created_at" => "[datetime]",
+    });
 
     CrateBuilder::new("foo_my_packages", user.as_model().id)
         .expect_build(&mut conn)
         .await;
 
     let response = user.get::<()>("/api/v1/me").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_json_snapshot!(response.json());
+    assert_snapshot!(response.status(), @"200 OK");
+    assert_json_snapshot!(response.json(), {
+        ".user.created_at" => "[datetime]",
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -49,7 +53,7 @@ async fn test_user_owned_crates_doesnt_include_deleted_ownership() {
         .expect_build(&mut conn)
         .await;
     krate
-        .owner_remove(&mut conn, &user_model.gh_login)
+        .owner_remove(&conn, &user_model.gh_login)
         .await
         .unwrap();
 

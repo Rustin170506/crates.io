@@ -1,0 +1,401 @@
+<script lang="ts">
+  import type { components } from '@crates-io/api-client';
+  import type { DocsRsStatus } from '$lib/utils/docs-rs';
+  import type { PlaygroundCrate } from '$lib/utils/playground';
+
+  import { resolve } from '$app/paths';
+  import { format, formatDistanceToNow, formatISO } from 'date-fns';
+  import prettyBytes from 'pretty-bytes';
+  import { MediaQuery } from 'svelte/reactivity';
+
+  import CopyButton from '$lib/components/CopyButton.svelte';
+  import Icon from '$lib/components/Icon.svelte';
+  import LicenseExpression from '$lib/components/LicenseExpression.svelte';
+  import OwnersList from '$lib/components/OwnersList.svelte';
+  import Tooltip from '$lib/components/Tooltip.svelte';
+  import { formatShortNum } from '$lib/utils/format-short-num';
+  import { buildPlaygroundLink } from '$lib/utils/playground';
+  import { getPurl } from '$lib/utils/purl';
+  import Edition from './Edition.svelte';
+  import InstallInstructions from './InstallInstructions.svelte';
+  import Link, { simplifyUrl } from './Link.svelte';
+  import Msrv from './Msrv.svelte';
+
+  const PLAYGROUND_TOOLTIP =
+    'The top 100 crates are available on the Rust Playground for you to try out directly in your browser.';
+
+  type Crate = components['schemas']['Crate'];
+  type Version = components['schemas']['Version'];
+  type Category = components['schemas']['Category'];
+  type Owner = components['schemas']['Owner'];
+
+  interface Props {
+    crate: Crate;
+    version: Version;
+    categories: Category[];
+    owners: Owner[];
+    requestedVersion?: boolean;
+    playgroundCratesPromise: Promise<PlaygroundCrate[]>;
+    docsRsStatusPromise: Promise<DocsRsStatus | null>;
+  }
+
+  let {
+    crate,
+    version,
+    categories,
+    owners,
+    requestedVersion = false,
+    playgroundCratesPromise,
+    docsRsStatusPromise,
+  }: Props = $props();
+
+  let canHover = new MediaQuery('hover: hover', false);
+
+  let showHomepage = $derived.by(() => {
+    let { repository, homepage } = crate;
+    return homepage && (!repository || simplifyUrl(repository) !== simplifyUrl(homepage));
+  });
+
+  let reportUrl = $derived(`${resolve('/support')}?crate=${encodeURIComponent(crate.name)}&inquire=crate-violation`);
+
+  let purl = $derived(getPurl(crate.name, version.num));
+
+  /** Computes the documentation link for a crate version. */
+  function computeDocumentationLink(docsRsStatus: DocsRsStatus | null): string | null {
+    let { documentation, name } = crate;
+
+    // if this is *not* a docs.rs link we'll return it directly
+    if (documentation && !documentation.startsWith('https://docs.rs/')) {
+      return documentation;
+    }
+
+    // if we know about a successful docs.rs build, we'll return a link to that
+    if (docsRsStatus?.doc_status === true) {
+      return `https://docs.rs/${name}/${version.num}`;
+    }
+
+    // finally, we'll return the specified documentation link, whatever it is
+    return documentation ?? null;
+  }
+</script>
+
+<section aria-label="Crate metadata" class="sidebar">
+  <div class="metadata">
+    <h2 class="heading">Metadata</h2>
+
+    <time datetime={formatISO(version.created_at)} class="date">
+      <Icon class="i-mdi:calendar-month" />
+      <span class="sr-only">Release date:</span>
+      <span>
+        {formatDistanceToNow(version.created_at, { addSuffix: true })}
+        <Tooltip>
+          Release date:
+          {format(version.created_at, 'PPP')}
+        </Tooltip>
+      </span>
+    </time>
+
+    {#if version.rust_version}
+      <div class="msrv" data-test-msrv>
+        <Icon class="i-simple-icons:rust" />
+        <span class="sr-only">Minimum Rust version:</span>
+        <Msrv msrv={version.rust_version} edition={version.edition ?? undefined} />
+      </div>
+    {:else if version.edition}
+      <div class="edition" data-test-edition>
+        <Icon class="i-simple-icons:rust" />
+        <Edition edition={version.edition} />
+      </div>
+    {/if}
+
+    {#if version.license}
+      <div class="license" data-test-license>
+        <Icon class="i-mdi:scale-balance" />
+        <span class="sr-only">License:</span>
+        <span>
+          <LicenseExpression license={version.license} />
+        </span>
+      </div>
+    {/if}
+
+    {#if version.linecounts?.total_code_lines}
+      <div class="linecount" data-test-linecounts>
+        <Icon class="i-mdi:code-tags" />
+        <span>
+          <!-- Use the OpenGraph image `threshold` so the sidebar matches the generated image -->
+          {formatShortNum(Number(version.linecounts.total_code_lines), { threshold: 1500 })} SLoC
+          <Tooltip>
+            Source Lines of Code<br />
+            <small>(excluding comments, integration tests and example code)</small>
+          </Tooltip>
+        </span>
+      </div>
+    {/if}
+
+    {#if version.crate_size}
+      <div class="bytes">
+        <Icon class="i-mdi:weight" />
+        <span class="sr-only">Size:</span>
+        <span>
+          {prettyBytes(version.crate_size, { binary: true })}
+          <Tooltip text="Compressed package size" />
+        </span>
+      </div>
+    {/if}
+
+    <div class="purl" data-test-purl>
+      <Icon class="i-mdi:link-variant" />
+      <span class="sr-only">Package URL:</span>
+      <CopyButton copyText={purl} class="button-reset purl-copy-button">
+        <span class="purl-text">{purl}</span>
+        <Tooltip>
+          <span class="purl-tooltip">
+            <strong>Package URL:</strong>
+            {purl}
+            <small>(click to copy)</small>
+          </span>
+        </Tooltip>
+      </CopyButton>
+      <a
+        href="https://github.com/package-url/purl-spec"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="purl-help-link"
+        aria-label="Learn more"
+      >
+        <Icon class="i-mdi:help-circle-outline" />
+        <Tooltip text="Learn more about Package URLs" />
+      </a>
+    </div>
+  </div>
+
+  {#if !version.yanked}
+    <div data-test-install>
+      <h2 class="heading">Install</h2>
+
+      <InstallInstructions
+        crate={crate.name}
+        version={version.num}
+        exactVersion={requestedVersion}
+        hasLib={version.has_lib !== false}
+        binNames={version.bin_names?.filter(Boolean as unknown as (name: string | null) => name is string)}
+      />
+    </div>
+  {/if}
+
+  {#snippet linksSection(docsRsStatus: DocsRsStatus | null)}
+    {@const documentationLink = computeDocumentationLink(docsRsStatus)}
+    {#if showHomepage || documentationLink || crate.repository}
+      <div class="links">
+        {#if showHomepage}
+          <Link title="Homepage" url={crate.homepage!} data-test-homepage-link />
+        {/if}
+
+        {#if documentationLink}
+          <Link title="Documentation" url={documentationLink} data-test-docs-link />
+        {/if}
+
+        {#if crate.repository}
+          <Link title="Repository" url={crate.repository} data-test-repository-link />
+        {/if}
+      </div>
+    {/if}
+  {/snippet}
+
+  {#await docsRsStatusPromise}
+    {@render linksSection(null)}
+  {:then docsRsStatus}
+    {@render linksSection(docsRsStatus)}
+  {:catch}
+    {@render linksSection(null)}
+  {/await}
+
+  <div>
+    <h2 class="heading">Owners</h2>
+    <OwnersList {owners} />
+  </div>
+
+  {#if categories.length !== 0}
+    <div>
+      <h2 class="heading">Categories</h2>
+      <ul class="categories">
+        {#each categories as category (category.id)}
+          <li><a href={resolve('/categories/[category_id]', { category_id: category.id })}>{category.category}</a></li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
+
+  <div>
+    {#await playgroundCratesPromise then playgroundCrates}
+      {@const playgroundCrate = playgroundCrates.find(it => it.name === crate.name)}
+      {#if playgroundCrate}
+        <!-- eslint-disable svelte/no-navigation-without-resolve -->
+        <a
+          href={buildPlaygroundLink(playgroundCrate.id)}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="playground-button button button--small"
+          data-test-playground-button
+        >
+          Try on Rust Playground
+          {#if canHover.current}
+            <Tooltip text={PLAYGROUND_TOOLTIP} />
+          {/if}
+        </a>
+        <!-- eslint-enable svelte/no-navigation-without-resolve -->
+        {#if !canHover.current}
+          <p class="playground-help text--small" data-test-playground-help>{PLAYGROUND_TOOLTIP}</p>
+        {/if}
+      {/if}
+    {:catch}
+      <!-- Silently ignore playground loading failures -->
+    {/await}
+
+    <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
+    <a href={reportUrl} data-test-id="link-crate-report" class="report-button button button--red button--small">
+      Report crate
+    </a>
+  </div>
+</section>
+
+<style>
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+
+    > * + * {
+      margin-top: var(--space-m);
+    }
+  }
+
+  .heading {
+    font-size: 1.17em;
+    margin: 0 0 var(--space-s);
+  }
+
+  .metadata {
+    > * + * {
+      margin-top: var(--space-2xs);
+    }
+  }
+
+  .date,
+  .msrv,
+  .edition,
+  .license,
+  .linecount,
+  .bytes,
+  .purl {
+    display: flex;
+    align-items: center;
+
+    :global(.icon) {
+      margin-right: var(--space-2xs);
+    }
+  }
+
+  .date,
+  .msrv,
+  .edition,
+  .linecount,
+  .bytes {
+    > span {
+      cursor: help;
+    }
+  }
+
+  .license {
+    :global(a) {
+      color: var(--main-color);
+    }
+  }
+
+  .linecount,
+  .bytes {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .purl {
+    align-items: flex-start;
+  }
+
+  .sidebar :global(.purl-copy-button) {
+    text-align: left;
+    width: 100%;
+    min-width: 0;
+    cursor: pointer;
+
+    &:focus {
+      outline: 2px solid var(--yellow500);
+      outline-offset: 1px;
+      border-radius: var(--space-3xs);
+    }
+  }
+
+  .purl-text {
+    word-break: break-all;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: block;
+  }
+
+  .purl-tooltip {
+    word-break: break-all;
+
+    > small {
+      word-break: normal;
+    }
+  }
+
+  .purl-help-link {
+    color: unset;
+    margin-left: var(--space-2xs);
+    flex-shrink: 0;
+
+    &:hover {
+      color: unset;
+    }
+
+    &:focus {
+      outline: 2px solid var(--yellow500);
+      outline-offset: 1px;
+      border-radius: var(--space-3xs);
+    }
+
+    :global(.icon) {
+      margin: 0;
+    }
+  }
+
+  .links {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-m);
+  }
+
+  .categories {
+    margin: 0;
+    padding-left: 20px;
+    line-height: 1.5;
+  }
+
+  .report-button,
+  .playground-button {
+    justify-content: center;
+    width: 220px;
+  }
+
+  .playground-button {
+    display: flex;
+    margin-bottom: var(--space-2xs);
+  }
+
+  .playground-help {
+    max-width: 220px;
+    text-align: justify;
+    line-height: 1.3em;
+  }
+</style>

@@ -1,0 +1,164 @@
+<script lang="ts">
+  import type { HTMLAttributes } from 'svelte/elements';
+
+  import Icon from '$lib/components/Icon.svelte';
+  import Tooltip from '$lib/components/Tooltip.svelte';
+  import { formatShortNum } from '$lib/utils/format-short-num';
+
+  interface Props extends HTMLAttributes<HTMLAnchorElement> {
+    title: string;
+    subtitle?: string;
+    href: string;
+    /** Version number shown on the trailing edge. */
+    version?: string;
+    /** Download count shown on the trailing edge in compact form. */
+    downloads?: number;
+  }
+
+  let { title, subtitle, href, version, downloads, class: className, ...restProps }: Props = $props();
+
+  // The accessible name is restricted to the crate name via `aria-labelledby`
+  // so the screen reader links list stays scannable; the subtitle and trailing
+  // value are exposed as a supplementary `aria-describedby` description that is
+  // announced after the name instead of being concatenated into it.
+  const uid = $props.id();
+  const titleId = `${uid}-title`;
+  const subtitleId = `${uid}-subtitle`;
+  const trailingId = `${uid}-trailing`;
+
+  let hasTrailing = $derived(Boolean(version) || downloads != null);
+  let describedBy = $derived.by(() => {
+    let describedByIds = [];
+
+    if (subtitle) {
+      describedByIds.push(subtitleId);
+    }
+    if (hasTrailing) {
+      describedByIds.push(trailingId);
+    }
+
+    if (describedByIds.length !== 0) {
+      return describedByIds.join(' ');
+    }
+  });
+</script>
+
+<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
+<a {href} class={['box', className]} aria-labelledby={titleId} aria-describedby={describedBy} {...restProps}>
+  <div class="left">
+    <div class="title" id={titleId} data-test-title>{title}</div>
+    {#if subtitle}
+      <div class="subtitle" id={subtitleId} data-test-subtitle>
+        {subtitle}
+        <Tooltip text={subtitle} onlyWhenTruncated delay={350} side="bottom" />
+      </div>
+    {/if}
+  </div>
+  {#if version}
+    <div class="version" id={trailingId}>
+      <span class="sr-only">version </span><span data-test-version>{version}</span>
+      <Tooltip text={version} onlyWhenTruncated delay={350} side="bottom" />
+    </div>
+  {:else if downloads != null}
+    <div class="downloads" id={trailingId} data-test-downloads>
+      <Icon class="i-mdi:download download-icon" />
+      {formatShortNum(downloads)}
+      <span class="sr-only">downloads</span>
+    </div>
+  {:else}
+    <Icon class="i-mdi:chevron-right right" />
+  {/if}
+</a>
+
+<style>
+  .box {
+    --shadow: 0 2px 3px light-dark(hsla(51, 50%, 44%, 0.35), #232321);
+
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: var(--space-2xl);
+    padding: 0 var(--space-s);
+    background-color: light-dark(white, #141413);
+    color: light-dark(#525252, #f9f7ec);
+    text-decoration: none;
+    border-radius: var(--space-3xs);
+    box-shadow: var(--shadow);
+    transition: background-color var(--transition-slow);
+
+    &:focus-visible {
+      outline: none;
+      box-shadow:
+        0 0 0 3px var(--yellow500),
+        var(--shadow);
+    }
+
+    &:hover,
+    &:focus-visible {
+      color: light-dark(#525252, #f9f7ec);
+      background-color: light-dark(hsl(58deg 72% 97%), hsl(204, 3%, 11%));
+      transition: background-color var(--transition-instant);
+    }
+
+    &:active {
+      transform: translateY(2px);
+      --shadow: inset 0 0 0 1px hsla(51, 50%, 44%, 0.15);
+    }
+  }
+
+  .left {
+    flex-grow: 1;
+    width: 0;
+  }
+
+  .title,
+  .subtitle {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .title {
+    font-size: 16px;
+  }
+
+  .subtitle {
+    margin-top: var(--space-3xs);
+    font-size: 13px;
+    color: light-dark(rgb(118, 131, 138), #cccac2);
+  }
+
+  .box :global(.right) {
+    height: var(--space-m);
+    width: var(--space-m);
+    margin-right: calc(-0.8 * var(--space-2xs));
+    color: light-dark(rgb(118, 131, 138), #cccac2);
+  }
+
+  .version,
+  .downloads {
+    flex-shrink: 0;
+    margin-left: var(--space-2xs);
+    font-size: 13px;
+    color: light-dark(rgb(118, 131, 138), #cccac2);
+  }
+
+  .version {
+    max-width: 5em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .downloads {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4xs);
+    white-space: nowrap;
+  }
+
+  .downloads :global(.download-icon) {
+    width: 1.1em;
+    height: 1.1em;
+  }
+</style>

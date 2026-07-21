@@ -1,0 +1,67 @@
+backend_lint:
+  - .github/workflows/**
+  - crates/**
+  - src/**
+  - Cargo.lock
+  - Cargo.toml
+  - rust-toolchain.toml
+
+backend_deps:
+  - .github/workflows/**
+  - Cargo.lock
+  - deny.toml
+  - mise.toml
+  - rust-toolchain.toml
+
+backend_migrations:
+  - .github/workflows/**
+  - migrations/**
+  - diesel-guard.toml
+  - mise.toml
+
+backend_test:
+  - .github/workflows/**
+  - crates/**
+  - migrations/**
+  - src/**
+  - Cargo.lock
+  - Cargo.toml
+  - diesel.toml
+  - mise.toml
+  - rust-toolchain.toml
+
+frontend_lint:
+  - .github/workflows/**
+  - package.json
+  - pnpm-lock.yaml
+  - '**/*.{css,html,json,json5,mjs,js,ts,svelte,yml,yaml}'
+
+msw_test:
+  - .github/workflows/**
+  - packages/crates-io-api-client/**
+  - packages/crates-io-msw/**
+  - pnpm-lock.yaml
+
+api_client_test:
+  - .github/workflows/**
+  - packages/crates-io-api-client/**
+  - src/tests/snapshots/integration__openapi__openapi_internal_snapshot-2.snap
+  - pnpm-lock.yaml
+
+e2e_test:
+  - .github/workflows/**
+  - e2e/**
+  - packages/crates-io-msw/**
+  - svelte/**
+  - package.json
+  - playwright.config.ts
+  - pnpm-lock.yaml
+
+svelte:
+  - .github/workflows/**
+  - svelte/**
+  - pnpm-lock.yaml
+
+zizmor:
+  - .github/workflows/**
+  - mise.toml

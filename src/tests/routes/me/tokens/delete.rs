@@ -1,8 +1,10 @@
-use crate::models::ApiToken;
-use crate::schema::api_tokens;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::util::{RequestHelper, TestApp};
+use claims::assert_ok;
+use crates_io::models::ApiToken;
+use crates_io::schema::api_tokens;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct RevokedResponse {}

@@ -4,15 +4,13 @@ use bon::Builder;
 use chrono::{DateTime, Utc};
 use crates_io_index::features::FeaturesMap;
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Deserialize;
 
-use crate::models::{Crate, User};
-use crate::schema::*;
+use crate::models::{Crate, TrustpubData, User};
+use crate::schema::{readme_renderings, users, versions};
 
-// Queryable has a custom implementation below
-#[derive(Clone, Identifiable, Associations, Debug, Queryable, Selectable)]
+#[derive(Clone, Identifiable, Associations, Debug, HasQuery)]
 #[diesel(belongs_to(Crate), belongs_to(crate::models::download::Version, foreign_key=id))]
 pub struct Version {
     pub id: i32,
@@ -26,10 +24,11 @@ pub struct Version {
     pub license: Option<String>,
     pub crate_size: i32,
     pub published_by: Option<i32>,
-    pub checksum: String,
+    pub tar_sha256: Vec<u8>,
     pub links: Option<String>,
     pub rust_version: Option<String>,
     pub has_lib: Option<bool>,
+    pub lib_name: Option<String>,
     pub bin_names: Option<Vec<Option<String>>>,
     pub yank_message: Option<String>,
     pub edition: Option<String>,
@@ -37,12 +36,20 @@ pub struct Version {
     pub homepage: Option<String>,
     pub documentation: Option<String>,
     pub repository: Option<String>,
+    pub trustpub_data: Option<TrustpubData>,
+    pub linecounts: Option<serde_json::Value>,
+    /// SHA256 checksum of the zip source archive,
+    /// or `None` if it has not been built yet.
+    pub zip_sha256: Option<Vec<u8>>,
+    /// SHA256 checksum of the zip source archive manifest,
+    /// or `None` if it has not been built yet.
+    pub zip_json_sha256: Option<Vec<u8>>,
 }
 
 impl Version {
     pub async fn record_readme_rendering(
         version_id: i32,
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
     ) -> QueryResult<usize> {
         use diesel::dsl::now;
 
@@ -51,15 +58,19 @@ impl Version {
             .on_conflict(readme_renderings::version_id)
             .do_update()
             .set(readme_renderings::rendered_at.eq(now))
-            .execute(conn)
+            .execute(&mut conn)
             .await
     }
 
     /// Gets the User who ran `cargo publish` for this version, if recorded.
     /// Not for use when you have a group of versions you need the publishers for.
-    pub async fn published_by(&self, conn: &mut AsyncPgConnection) -> QueryResult<Option<User>> {
+    pub async fn published_by(&self, mut conn: &AsyncPgConnection) -> QueryResult<Option<User>> {
         match self.published_by {
-            Some(pb) => users::table.find(pb).first(conn).await.optional(),
+            Some(pb) => User::query()
+                .filter(users::id.eq(pb))
+                .first(&mut conn)
+                .await
+                .optional(),
             None => Ok(None),
         }
     }
@@ -91,12 +102,13 @@ pub struct NewVersion<'a> {
     license: Option<&'a str>,
     #[builder(default, name = "size")]
     crate_size: i32,
-    published_by: i32,
-    checksum: &'a str,
+    published_by: Option<i32>,
+    tar_sha256: &'a [u8],
     links: Option<&'a str>,
     rust_version: Option<&'a str>,
-    pub has_lib: Option<bool>,
-    pub bin_names: Option<&'a [&'a str]>,
+    has_lib: Option<bool>,
+    lib_name: Option<&'a str>,
+    bin_names: Option<&'a [&'a str]>,
     edition: Option<&'a str>,
     description: Option<&'a str>,
     homepage: Option<&'a str>,
@@ -104,37 +116,17 @@ pub struct NewVersion<'a> {
     repository: Option<&'a str>,
     categories: Option<&'a [&'a str]>,
     keywords: Option<&'a [&'a str]>,
+    trustpub_data: Option<&'a TrustpubData>,
+    linecounts: Option<serde_json::Value>,
 }
 
 impl NewVersion<'_> {
-    pub async fn save(
-        &self,
-        conn: &mut AsyncPgConnection,
-        published_by_email: &str,
-    ) -> QueryResult<Version> {
-        use diesel::insert_into;
-
-        conn.transaction(|conn| {
-            async move {
-                let version: Version = insert_into(versions::table)
-                    .values(self)
-                    .returning(Version::as_returning())
-                    .get_result(conn)
-                    .await?;
-
-                insert_into(versions_published_by::table)
-                    .values((
-                        versions_published_by::version_id.eq(version.id),
-                        versions_published_by::email.eq(published_by_email),
-                    ))
-                    .execute(conn)
-                    .await?;
-
-                Ok(version)
-            }
-            .scope_boxed()
-        })
-        .await
+    pub async fn save(&self, mut conn: &AsyncPgConnection) -> QueryResult<Version> {
+        diesel::insert_into(versions::table)
+            .values(self)
+            .returning(Version::as_returning())
+            .get_result(&mut conn)
+            .await
     }
 }
 
@@ -146,6 +138,7 @@ fn strip_build_metadata(version: &str) -> &str {
 }
 
 /// The highest version (semver order) and the most recently updated version.
+///
 /// Typically used for a single crate.
 /// Note: `TopVersion` itself does not guarantee whether versions are yanked or not,
 /// this must be guaranteed by the input versions.
@@ -160,13 +153,13 @@ pub struct TopVersions {
 }
 
 impl TopVersions {
-    /// Return both the newest (most recently updated) and the
+    /// Returns both the newest (most recently updated) and the
     /// highest version (in semver order) for a list of `Version` instances.
     pub fn from_versions(versions: Vec<Version>) -> Self {
         Self::from_date_version_pairs(versions.into_iter().map(|v| (v.created_at, v.num)))
     }
 
-    /// Return both the newest (most recently updated) and the
+    /// Returns both the newest (most recently updated) and the
     /// highest version (in semver order) for a collection of date/version pairs.
     pub fn from_date_version_pairs<T>(pairs: T) -> Self
     where

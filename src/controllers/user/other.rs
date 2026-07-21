@@ -1,15 +1,15 @@
-use axum::Json;
-use axum::extract::Path;
-use bigdecimal::{BigDecimal, ToPrimitive};
-use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
-
 use crate::app::AppState;
 use crate::models::{CrateOwner, OwnerKind, User};
 use crate::schema::{crate_downloads, crate_owners, crates};
 use crate::util::errors::AppResult;
 use crate::views::EncodablePublicUser;
-use crates_io_diesel_helpers::lower;
+use axum::Json;
+use axum::extract::Path;
+use bigdecimal::{BigDecimal, ToPrimitive};
+use crates_io_database::fns::lower;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GetResponse {
@@ -32,10 +32,10 @@ pub async fn find_user(
 ) -> AppResult<Json<GetResponse>> {
     let mut conn = state.db_read_prefer_primary().await?;
 
-    use crate::schema::users::dsl::{gh_login, id, users};
+    use crate::schema::users::dsl::{gh_login, id};
 
     let name = lower(&user_name);
-    let user: User = users
+    let user: User = User::query()
         .filter(lower(gh_login).eq(name))
         .order(id.desc())
         .first(&mut conn)

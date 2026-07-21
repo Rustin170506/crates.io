@@ -1,22 +1,26 @@
-use axum::Json;
-use axum::extract::{FromRequestParts, Query};
-use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use http::request::Parts;
-use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
-
 use crate::app::AppState;
-use crate::controllers::user::update::UserConfirmEmail;
+use crate::controllers::helpers::OkResponse;
+use crate::email::EmailMessage;
 use crate::email::Emails;
 use crate::middleware::log_request::RequestLogExt;
-use crate::models::{NewEmail, NewUser, User};
-use crate::schema::users;
+use crate::models::{NewEmail, NewOauthGithub, NewUser, OauthGithub};
+use crate::schema::{oauth_github, users};
 use crate::util::diesel::is_read_only_error;
 use crate::util::errors::{AppResult, bad_request, server_error};
+use crate::util::oauth::ReqwestClient;
 use crate::views::EncodableMe;
-use crates_io_github::GithubUser;
+use axum::Json;
+use chrono::Utc;
+use crates_io_github::{GitHubAuth, GitHubUser};
 use crates_io_session::SessionExtension;
+use diesel::prelude::*;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use http::request::Parts;
+use minijinja::context;
+use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BeginResponse {
@@ -36,9 +40,10 @@ pub struct BeginResponse {
 ///
 /// see <https://developer.github.com/v3/oauth/#redirect-users-to-request-github-access>
 #[utoipa::path(
-    get,
+    post,
     path = "/api/private/session/begin",
     tag = "session",
+    extensions(("x-internal" = json!(true))),
     responses((status = 200, description = "Successful Response", body = inline(BeginResponse))),
 )]
 pub async fn begin_session(app: AppState, session: SessionExtension) -> Json<BeginResponse> {
@@ -55,10 +60,13 @@ pub async fn begin_session(app: AppState, session: SessionExtension) -> Json<Beg
     Json(BeginResponse { url, state })
 }
 
-#[derive(Clone, Debug, Deserialize, FromRequestParts)]
-#[from_request(via(Query))]
-pub struct AuthorizeQuery {
+#[derive(Clone, Debug, Deserialize, utoipa::ToSchema)]
+pub struct AuthorizeBody {
+    /// Temporary code received from the GitHub API.
+    #[schema(value_type = String, example = "901dd10e07c7e9fa1cd5")]
     code: AuthorizationCode,
+    /// State parameter received from the GitHub API.
+    #[schema(value_type = String, example = "fYcUY3FMdUUz00FC7vLT7A")]
     state: CsrfToken,
 }
 
@@ -70,38 +78,37 @@ pub struct AuthorizeQuery {
 /// the corresponding user information.
 ///
 /// see <https://developer.github.com/v3/oauth/#github-redirects-back-to-your-site>
-///
-/// ## Query Parameters
-///
-/// - `code` – temporary code received from the GitHub API  **(Required)**
-/// - `state` – state parameter received from the GitHub API  **(Required)**
 #[utoipa::path(
-    get,
+    post,
     path = "/api/private/session/authorize",
     tag = "session",
+    request_body = inline(AuthorizeBody),
+    extensions(("x-internal" = json!(true))),
     responses((status = 200, description = "Successful Response", body = inline(EncodableMe))),
 )]
 pub async fn authorize_session(
-    query: AuthorizeQuery,
     app: AppState,
     session: SessionExtension,
     req: Parts,
+    Json(body): Json<AuthorizeBody>,
 ) -> AppResult<Json<EncodableMe>> {
     // Make sure that the state we just got matches the session state that we
     // should have issued earlier.
     let session_state = session.remove("github_oauth_state").map(CsrfToken::new);
-    if session_state.is_none_or(|state| query.state.secret() != state.secret()) {
+    if session_state.is_none_or(|session_state| body.state.secret() != session_state.secret()) {
         return Err(bad_request("invalid state parameter"));
     }
 
     // Fetch the access token from GitHub using the code we just got
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let client = ReqwestClient(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+    );
 
     let token = app
         .github_oauth
-        .exchange_code(query.code)
+        .exchange_code(body.code)
         .request_async(&client)
         .await
         .map_err(|err| {
@@ -111,86 +118,186 @@ pub async fn authorize_session(
 
     let token = token.access_token();
 
+    // Encrypt the GitHub access token
+    let encryption = &app.config.token_encryption;
+    let encrypted_token = encryption.encrypt(token.secret()).map_err(|error| {
+        error!("Failed to encrypt GitHub token: {error}");
+        server_error("Internal server error")
+    })?;
+
     // Fetch the user info from GitHub using the access token we just got and create a user record
-    let ghuser = app.github.current_user(token).await?;
+    let auth = GitHubAuth::bearer(token.secret().clone());
+    let ghuser = app.github.current_user(&auth).await?;
 
     let mut conn = app.db_write().await?;
-    let user = save_user_to_database(&ghuser, token.secret(), &app.emails, &mut conn).await?;
+    let user_id = save_user_to_database(&ghuser, &encrypted_token, &app.emails, &mut conn).await?;
 
     // Log in by setting a cookie and the middleware authentication
-    session.insert("user_id".to_string(), user.id.to_string());
+    session.insert("user_id".to_string(), user_id.to_string());
 
-    super::user::me::get_authenticated_user(app, req).await
+    super::user::me::authenticated_user(&mut conn, user_id).await
 }
 
 pub async fn save_user_to_database(
-    user: &GithubUser,
-    access_token: &str,
+    gh_user: &GitHubUser,
+    encrypted_token: &[u8],
     emails: &Emails,
     conn: &mut AsyncPgConnection,
-) -> QueryResult<User> {
-    let new_user = NewUser::builder()
-        .gh_id(user.id)
-        .gh_login(&user.login)
-        .maybe_name(user.name.as_deref())
-        .maybe_gh_avatar(user.avatar_url.as_deref())
-        .gh_access_token(access_token)
-        .build();
-
-    match create_or_update_user(&new_user, user.email.as_deref(), emails, conn).await {
-        Ok(user) => Ok(user),
+) -> QueryResult<i32> {
+    // There should not be one transaction around both the `create_or_update_user` call and the
+    // `find_user_by_gh_id` call. If they're in one transaction and we're in read only mode, the
+    // entire transaction will be poisoned and the `find_user_by_gh_id` will fail too, thus
+    // negating the purpose of the fallback. There _is_ a transaction around the body of
+    // `create_or_update_user`.
+    match create_or_update_user(gh_user, encrypted_token, emails, conn).await {
+        Ok(id) => Ok(id),
         Err(error) if is_read_only_error(&error) => {
-            // If we're in read only mode, we can't update their details
+            // If we're in read only mode, we can't update their details or create new users.
             // just look for an existing user
-            find_user_by_gh_id(conn, user.id).await?.ok_or(error)
+            find_user_by_gh_id(conn, gh_user.id).await?.ok_or(error)
         }
         Err(error) => Err(error),
     }
 }
 
-/// Inserts the user into the database, or updates an existing one.
-///
-/// This method also inserts the email address into the `emails` table
-/// and sends a confirmation email to the user.
+/// Updates an existing user or inserts a new user into the database within a transaction.
 async fn create_or_update_user(
-    new_user: &NewUser<'_>,
-    email: Option<&str>,
+    gh_user: &GitHubUser,
+    encrypted_token: &[u8],
     emails: &Emails,
     conn: &mut AsyncPgConnection,
-) -> QueryResult<User> {
-    conn.transaction(|conn| {
-        async move {
-            let user = new_user.insert_or_update(conn).await?;
+) -> QueryResult<i32> {
+    conn.transaction(async |conn| {
+        let update_result = update_user(gh_user, encrypted_token, conn).await;
 
-            // To send the user an account verification email
-            if let Some(user_email) = email {
-                let new_email = NewEmail::builder()
-                    .user_id(user.id)
-                    .email(user_email)
-                    .build();
-
-                if let Some(token) = new_email.insert_if_missing(conn).await? {
-                    // Swallows any error. Some users might insert an invalid email address here.
-                    let email = UserConfirmEmail {
-                        user_name: &user.gh_login,
-                        domain: &emails.domain,
-                        token,
-                    };
-                    let _ = emails.send(user_email, email).await;
-                }
+        match update_result {
+            Ok(user_id) => Ok(user_id),
+            Err(diesel::result::Error::NotFound) => {
+                // If the update fails because the `oauth_github` record doesn't exist, this
+                // currently means the `user` record doesn't exist either and we need to create
+                // both. This assumption holds because crates.io and GitHub accounts currently have
+                // a one-to-one relationship; this will need to be changed if/when we allow
+                // crates.io users to link more than one GitHub account to their crates.io account.
+                create_user(gh_user, encrypted_token, emails, conn).await
             }
-
-            Ok(user)
+            Err(error) => Err(error),
         }
-        .scope_boxed()
     })
     .await
 }
 
-async fn find_user_by_gh_id(conn: &mut AsyncPgConnection, gh_id: i32) -> QueryResult<Option<User>> {
+/// Updates an existing user. Should be called in a transaction, as `create_or_update_user` does,
+/// so both the `users` and `oauth_github` records are updated or neither are.
+///
+/// Returns an error if the `oauth_github` or `users` records don't exist.
+async fn update_user(
+    gh_user: &GitHubUser,
+    encrypted_token: &[u8],
+    conn: &mut AsyncPgConnection,
+) -> QueryResult<i32> {
+    // First, try to update an existing `oauth_github` record with the specified GitHub ID
+    // and the associated `users` record.
+    //
+    // For now, update user display name, gh_login, and username. Eventually, we will
+    // get rid of `gh_login` and stop syncing `name` and `username` with GitHub.
+    let oauth_github = diesel::update(oauth_github::table)
+        .filter(oauth_github::account_id.eq(gh_user.id as i64))
+        .set((
+            oauth_github::encrypted_token.eq(encrypted_token),
+            oauth_github::login.eq(&gh_user.login),
+            oauth_github::avatar.eq(gh_user.avatar_url.as_deref()),
+            oauth_github::last_sync.eq(Utc::now()),
+        ))
+        .get_result::<OauthGithub>(conn)
+        .await?;
+    diesel::update(users::table)
+        .filter(users::id.eq(oauth_github.user_id))
+        .set((
+            users::name.eq(gh_user.name.as_ref()),
+            users::username.eq(&gh_user.login),
+            // These fields are soon to be deprecated.
+            users::gh_login.eq(&gh_user.login),
+            users::gh_encrypted_token.eq(encrypted_token),
+        ))
+        .execute(conn)
+        .await?;
+
+    Ok(oauth_github.user_id)
+}
+
+/// Inserts a new user into the database.
+///
+/// This method also inserts the email address into the `emails` table
+/// and sends a confirmation email to the user.
+///
+/// Should be called in a transaction, as `create_or_update_user` does, so both the `users` and
+/// `emails` records are inserted or neither are.
+async fn create_user(
+    gh_user: &GitHubUser,
+    encrypted_token: &[u8],
+    emails: &Emails,
+    conn: &mut AsyncPgConnection,
+) -> QueryResult<i32> {
+    let new_user = NewUser::builder()
+        .gh_id(gh_user.id)
+        .gh_login(&gh_user.login)
+        .username(&gh_user.login)
+        .maybe_name(gh_user.name.as_deref())
+        .gh_encrypted_token(encrypted_token)
+        .build();
+
+    let user_id = new_user.insert(conn).await?;
+
+    let new_oauth_github = NewOauthGithub::builder()
+        .user_id(user_id)
+        .account_id(gh_user.id as i64)
+        .encrypted_token(encrypted_token)
+        .login(&gh_user.login)
+        .maybe_avatar(gh_user.avatar_url.as_deref())
+        .build();
+
+    new_oauth_github.insert(conn).await?;
+
+    // Since this is a new user, send an account verification email
+    if let Some(user_email) = gh_user.email.as_deref() {
+        let new_email = NewEmail::builder()
+            .user_id(user_id)
+            .email(user_email)
+            .build();
+
+        if let Some(token) = new_email.insert_if_missing(conn).await? {
+            let email = EmailMessage::from_template(
+                "user_confirm",
+                context! {
+                    user_name => new_user.gh_login,
+                    domain => emails.domain,
+                    token => token.expose_secret()
+                },
+            );
+
+            match email {
+                Ok(email) => {
+                    // Swallows any error. Users might insert an invalid email address, but
+                    // they should still be allowed to create an account; they will need to
+                    // fix their email address later.
+                    let _ = emails.send(user_email, email).await;
+                }
+                Err(error) => {
+                    warn!("Failed to render user confirmation email template: {error}");
+                }
+            };
+        }
+    }
+
+    Ok(user_id)
+}
+
+async fn find_user_by_gh_id(mut conn: &AsyncPgConnection, gh_id: i32) -> QueryResult<Option<i32>> {
     users::table
-        .filter(users::gh_id.eq(gh_id))
-        .first(conn)
+        .inner_join(oauth_github::table)
+        .filter(oauth_github::account_id.eq(gh_id as i64))
+        .select(users::id)
+        .first(&mut conn)
         .await
         .optional()
 }
@@ -201,11 +308,12 @@ async fn find_user_by_gh_id(conn: &mut AsyncPgConnection, gh_id: i32) -> QueryRe
     path = "/api/private/session",
     security(("cookie" = [])),
     tag = "session",
-    responses((status = 200, description = "Successful Response")),
+    extensions(("x-internal" = json!(true))),
+    responses((status = 200, description = "Successful Response", body = inline(OkResponse))),
 )]
-pub async fn end_session(session: SessionExtension) -> Json<bool> {
+pub async fn end_session(session: SessionExtension) -> OkResponse {
     session.remove("user_id");
-    Json(true)
+    OkResponse::new()
 }
 
 #[cfg(test)]
@@ -220,14 +328,15 @@ mod tests {
         let test_db = TestDatabase::new();
         let mut conn = test_db.async_connect().await;
 
-        let gh_user = GithubUser {
+        let gh_user = GitHubUser {
             email: Some("String.Format(\"{0}.{1}@live.com\", FirstName, LastName)".into()),
             name: Some("My Name".into()),
             login: "github_user".into(),
             id: -1,
             avatar_url: None,
         };
-        let result = save_user_to_database(&gh_user, "arbitrary_token", &emails, &mut conn).await;
+
+        let result = save_user_to_database(&gh_user, &[], &emails, &mut conn).await;
 
         assert!(
             result.is_ok(),

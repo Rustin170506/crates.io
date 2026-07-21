@@ -1,0 +1,47 @@
+import { createClient } from '@crates-io/api-client';
+
+import { loadNativeReplacements } from '$lib/data/native-replacements';
+import { loadDocsRsStatus } from '$lib/utils/docs-rs';
+import { loadReadme } from '$lib/utils/readme';
+import { loadUnmaintained } from '$lib/utils/rustsec';
+
+export async function load({ fetch, params, parent }) {
+  let client = createClient({ fetch });
+
+  let crateName = params.crate_id;
+  let downloadsPromise = loadDownloads(client, crateName);
+
+  let [{ crate, defaultVersion }, nativeReplacements, unmaintained] = await Promise.all([
+    parent(),
+    loadNativeReplacements(fetch),
+    loadUnmaintained(fetch, crateName),
+  ]);
+  let readmePromise = loadReadme(fetch, crate.name, defaultVersion.num);
+  let docsRsStatusPromise = loadDocsRsStatus(fetch, crate.name, defaultVersion.num);
+
+  return { readmePromise, downloadsPromise, docsRsStatusPromise, nativeReplacements, unmaintained };
+}
+
+/**
+ * Loads download data for a crate (all versions).
+ *
+ * This loads the per-day downloads for the last 90 days for the latest 5
+ * versions plus the sum of the rest ("Other").
+ */
+async function loadDownloads(client: ReturnType<typeof createClient>, name: string) {
+  let response = await client.GET('/api/v1/crates/{name}/downloads', {
+    params: { path: { name }, query: { include: 'versions' } },
+  });
+
+  if (response.error) {
+    throw new Error('Failed to load download data');
+  }
+
+  let { version_downloads, versions, meta } = response.data;
+
+  return {
+    versionDownloads: version_downloads,
+    extraDownloads: meta.extra_downloads,
+    versions: versions ?? [],
+  };
+}

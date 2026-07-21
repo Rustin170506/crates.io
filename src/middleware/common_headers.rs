@@ -1,4 +1,3 @@
-use crate::app::AppState;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -12,45 +11,43 @@ const NGINX_SUCCESS_CODES: [u16; 10] = [200, 201, 204, 206, 301, 203, 303, 304, 
 const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const ONE_YEAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-pub async fn add_common_headers(
-    state: AppState,
-    request: Request,
-    next: Next,
-) -> impl IntoResponse {
+pub async fn add_common_headers(request: Request, next: Next) -> impl IntoResponse {
     let v = HeaderValue::from_static;
-
-    let mut headers = HeaderMap::new();
 
     let path = request.uri().path();
 
-    const STATIC_FILES: [&str; 5] = [
+    const STATIC_FILES: [&str; 6] = [
+        "/github-auth-loading.html",
         "/github-redirect.html",
         "/favicon.ico",
         "/robots.txt",
         "/opensearch.xml",
         "/.well-known/security.txt",
     ];
-    if STATIC_FILES.contains(&path) {
-        expires(&mut headers, ONE_DAY);
-    }
-
-    if path.starts_with("/assets/") {
-        expires(&mut headers, 10 * ONE_YEAR);
-    }
+    let cache_duration = if STATIC_FILES.contains(&path) {
+        Some(ONE_DAY)
+    } else if path.starts_with("/_app/immutable/") {
+        Some(10 * ONE_YEAR)
+    } else {
+        None
+    };
 
     let response = next.run(request).await;
 
+    let mut headers = HeaderMap::new();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v("*"));
     headers.insert(header::STRICT_TRANSPORT_SECURITY, v("max-age=31536000"));
+
+    if let Some(cache_duration) = cache_duration
+        && response.status().is_success()
+    {
+        expires(&mut headers, cache_duration);
+    }
 
     if NGINX_SUCCESS_CODES.contains(&response.status().as_u16()) {
         headers.insert(header::X_CONTENT_TYPE_OPTIONS, v("nosniff"));
         headers.insert(header::X_FRAME_OPTIONS, v("SAMEORIGIN"));
         headers.insert(header::X_XSS_PROTECTION, v("0"));
-        if let Some(ref csp) = state.config.content_security_policy {
-            headers.insert(header::CONTENT_SECURITY_POLICY, csp.clone());
-        }
-        headers.insert(header::VARY, v("Accept, Accept-Encoding, Cookie"));
     }
 
     (headers, response)

@@ -1,31 +1,41 @@
 use super::{MockAnonymousUser, MockCookieUser, MockTokenUser};
-use crate::config::{
-    self, Base, CdnLogQueueConfig, CdnLogStorageConfig, DatabasePools, DbPoolConfig,
+use crate::util::chaosproxy::ChaosProxy;
+use crate::util::github::MOCK_GITHUB_DATA;
+use claims::assert_some;
+use crates_io::config::{
+    self, Base, BindConfig, CdnLogQueueConfig, CdnLogStorageConfig, DatabasePools, DatadogConfig,
+    DbPoolConfig, FeaturesConfig, FrontendConfig, GitHubOAuthConfig, PublishLimitsConfig,
+    RateLimitsConfig,
 };
-use crate::middleware::cargo_compat::StatusCodeConfig;
-use crate::models::NewEmail;
-use crate::models::token::{CrateScope, EndpointScope};
-use crate::rate_limiter::{LimitedAction, RateLimiterConfig};
-use crate::storage::StorageConfig;
-use crate::tests::util::chaosproxy::ChaosProxy;
-use crate::tests::util::github::MOCK_GITHUB_DATA;
-use crate::worker::{Environment, RunnerExt};
-use crate::{App, Emails, Env};
-use crates_io_github::MockGitHubClient;
+use crates_io::middleware::cargo_compat::StatusCodeConfig;
+use crates_io::models::token::{CrateScope, EndpointScope};
+use crates_io::models::{NewEmail, User};
+use crates_io::rate_limiter::{LimitedAction, RateLimiterConfig};
+use crates_io::storage::StorageConfig;
+use crates_io::worker::{Environment, RunnerExt};
+use crates_io::{App, Emails, Env};
+use crates_io_docs_rs::MockDocsRsClient;
+use crates_io_encryption::TokenEncryption;
+use crates_io_github::{GitHubClient, MockGitHubClient};
+use crates_io_github_app::MockGitHubApp;
 use crates_io_index::testing::UpstreamIndex;
 use crates_io_index::{Credentials, RepositoryConfig};
+use crates_io_og_image::OgImageGenerator;
 use crates_io_team_repo::MockTeamRepo;
 use crates_io_test_db::TestDatabase;
+use crates_io_test_utils::builders::OauthGithubBuilder;
+use crates_io_trustpub::github::test_helpers::AUDIENCE;
+use crates_io_trustpub::keystore::{MockOidcKeyStore, OidcKeyStore};
 use crates_io_worker::Runner;
 use diesel_async::AsyncPgConnection;
 use futures_util::TryStreamExt;
 use oauth2::{ClientId, ClientSecret};
-use regex::Regex;
-use std::collections::HashSet;
-use std::sync::LazyLock;
+use regex::regex;
+use std::collections::HashMap;
 use std::{rc::Rc, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
+use url::Url;
 
 struct TestAppInner {
     app: Arc<App>,
@@ -42,7 +52,7 @@ struct TestAppInner {
 
 impl Drop for TestAppInner {
     fn drop(&mut self) {
-        use crate::schema::background_jobs;
+        use crates_io::schema::background_jobs;
         use diesel::prelude::*;
 
         // Avoid a double-panic if the test is already failing
@@ -50,23 +60,29 @@ impl Drop for TestAppInner {
             return;
         }
 
-        // Lazily run any remaining jobs
-        if let Some(runner) = &self.runner {
-            block_in_place(move || {
-                Handle::current().block_on(async {
-                    let handle = runner.start();
-                    handle.wait_for_shutdown().await;
-                })
-            });
-        }
-
-        // Manually verify that all jobs have completed successfully
-        // This will catch any tests that enqueued a job but forgot to initialize the runner
         let mut conn = self.test_database.connect();
-        let job_count: i64 = background_jobs::table
+        let mut job_count: i64 = background_jobs::table
             .count()
             .get_result(&mut conn)
             .unwrap();
+
+        if job_count > 0 {
+            // Run any remaining jobs that a test enqueued but never ran.
+            if let Some(runner) = &self.runner {
+                block_in_place(move || {
+                    Handle::current().block_on(async {
+                        let handle = runner.start();
+                        handle.wait_for_shutdown().await;
+                    })
+                });
+            }
+
+            job_count = background_jobs::table
+                .count()
+                .get_result(&mut conn)
+                .unwrap();
+        }
+
         assert_eq!(
             0, job_count,
             "Unprocessed or failed jobs remain in the queue"
@@ -90,23 +106,39 @@ impl Drop for TestAppInner {
 pub struct TestApp(Rc<TestAppInner>);
 
 impl TestApp {
-    /// Initialize an application with an `Uploader` that panics
+    /// Initializes an application with an `Uploader` that panics
     pub fn init() -> TestAppBuilder {
-        crate::util::tracing::init_for_test();
+        crates_io::util::tracing::init_for_test();
+
+        let mut index_sync_github_app = MockGitHubApp::new();
+        index_sync_github_app
+            .expect_installation_token()
+            .returning(|| Ok(secrecy::SecretString::from("test-token")));
+
+        let mut sync_github_app = MockGitHubApp::new();
+        sync_github_app
+            .expect_installation_token()
+            .returning(|| Ok(secrecy::SecretString::from("test-token")));
 
         TestAppBuilder {
             config: simple_config(),
             index: None,
+            index_location: None,
             build_job_runner: false,
             use_chaos_proxy: false,
             team_repo: MockTeamRepo::new(),
+            index_sync_github_app: Some(index_sync_github_app),
+            sync_github_app: Some(sync_github_app),
             github: None,
+            docs_rs: None,
+            oidc_key_stores: Default::default(),
+            og_image_generator: None,
         }
     }
 
-    /// Initialize a full application, with a proxy, index, and background worker
+    /// Initializes a full application with a background worker.
     pub fn full() -> TestAppBuilder {
-        Self::init().with_git_index().with_job_runner()
+        Self::init().with_job_runner()
     }
 
     /// Obtain an async database connection from the primary database pool.
@@ -119,22 +151,23 @@ impl TestApp {
     ///
     /// This method updates the database directly
     pub async fn db_new_user(&self, username: &str) -> MockCookieUser {
-        let mut conn = self.db_conn().await;
+        let conn = self.db_conn().await;
 
         let email = format!("{username}@example.com");
 
-        let user = crate::tests::new_user(username)
-            .insert(&mut conn)
-            .await
-            .unwrap();
+        let new_user = crate::new_user(username);
+        let id = new_user.insert(&conn).await.unwrap();
+        let user = User::find(&conn, id).await.unwrap();
+
+        OauthGithubBuilder::for_user(&user).insert(&conn).await;
 
         let new_email = NewEmail::builder()
-            .user_id(user.id)
+            .user_id(id)
             .email(&email)
             .verified(true)
             .build();
 
-        new_email.insert(&mut conn).await.unwrap();
+        new_email.insert(&conn).await.unwrap();
 
         MockCookieUser {
             app: self.clone(),
@@ -142,12 +175,12 @@ impl TestApp {
         }
     }
 
-    /// Obtain a reference to the upstream repository ("the index")
+    /// Obtains a reference to the upstream repository ("the index")
     pub fn upstream_index(&self) -> &UpstreamIndex {
         assert_some!(self.0.index.as_ref())
     }
 
-    /// Obtain a list of crates from the index HEAD
+    /// Obtains a list of crates from the index HEAD
     pub fn crates_from_index_head(&self, crate_name: &str) -> Vec<crates_io_index::Crate> {
         self.upstream_index()
             .crates_from_index_head(crate_name)
@@ -171,17 +204,13 @@ impl TestApp {
     }
 
     pub async fn emails_snapshot(&self) -> String {
-        static EMAIL_HEADER_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(Message-ID|Date): [^\r\n]+\r\n").unwrap());
+        let email_header_re = regex!(r"(Message-ID|Date): [^\r\n]+\r\n");
+        let date_time_re = regex!(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z");
+        let email_confirm_re = regex!(r"/confirm/\w+");
+        let invite_token_re = regex!(r"/accept-invite/\w+");
 
-        static DATE_TIME_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z").unwrap());
-
-        static EMAIL_CONFIRM_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"/confirm/\w+").unwrap());
-
-        static INVITE_TOKEN_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"/accept-invite/\w+").unwrap());
+        // MIME boundary strings are randomly generated alphanumeric strings
+        let mime_boundary_re = regex!(r"[A-Za-z0-9]{32,}");
 
         static SEPARATOR: &str = "\n----------------------------------------\n\n";
 
@@ -189,10 +218,16 @@ impl TestApp {
             .await
             .into_iter()
             .map(|email| {
-                let email = EMAIL_HEADER_REGEX.replace_all(&email, "");
-                let email = DATE_TIME_REGEX.replace_all(&email, "[0000-00-00T00:00:00Z]");
-                let email = EMAIL_CONFIRM_REGEX.replace_all(&email, "/confirm/[confirm-token]");
-                let email = INVITE_TOKEN_REGEX.replace_all(&email, "/accept-invite/[invite-token]");
+                use quoted_printable::{ParseMode, decode};
+
+                let decoded_email = decode(&email, ParseMode::Robust).unwrap();
+                let email = String::from_utf8_lossy(&decoded_email);
+
+                let email = email_header_re.replace_all(&email, "");
+                let email = date_time_re.replace_all(&email, "[0000-00-00T00:00:00Z]");
+                let email = email_confirm_re.replace_all(&email, "/confirm/[confirm-token]");
+                let email = invite_token_re.replace_all(&email, "/accept-invite/[invite-token]");
+                let email = mime_boundary_re.replace_all(&email, "[boundary]");
                 email.to_string()
             })
             .collect::<Vec<_>>()
@@ -200,22 +235,37 @@ impl TestApp {
     }
 
     pub async fn run_pending_background_jobs(&self) {
+        self.try_run_pending_background_jobs()
+            .await
+            .expect("Could not determine if jobs failed");
+    }
+
+    /// Run all pending background jobs and return an error if any of them
+    /// failed. Intended for tests that deliberately exercise a job's failure
+    /// path.
+    pub async fn try_run_pending_background_jobs(&self) -> anyhow::Result<()> {
         let runner = &self.0.runner;
         let runner = runner.as_ref().expect("Index has not been initialized");
 
         let handle = runner.start();
         handle.wait_for_shutdown().await;
 
-        let result = runner.check_for_failed_jobs().await;
-        result.expect("Could not determine if jobs failed");
+        runner.check_for_failed_jobs().await
     }
 
-    /// Obtain a reference to the inner `App` value
+    /// Obtains a reference to the inner `App` value
     pub fn as_inner(&self) -> &App {
         &self.0.app
     }
 
-    /// Obtain a reference to the axum Router
+    /// Name of the per-test Postgres schema backing this `TestApp`. Pass this
+    /// to jobs or helpers that need to scope SQL operations to the test's
+    /// schema (e.g. `pg_dump --schema=<x>`).
+    pub fn db_schema(&self) -> &str {
+        self.0.test_database.schema()
+    }
+
+    /// Obtains a reference to the axum Router
     pub fn router(&self) -> &axum::Router {
         &self.0.router
     }
@@ -238,14 +288,20 @@ impl TestApp {
 pub struct TestAppBuilder {
     config: config::Server,
     index: Option<UpstreamIndex>,
+    index_location: Option<Url>,
     build_job_runner: bool,
     use_chaos_proxy: bool,
     team_repo: MockTeamRepo,
+    index_sync_github_app: Option<MockGitHubApp>,
+    sync_github_app: Option<MockGitHubApp>,
     github: Option<MockGitHubClient>,
+    docs_rs: Option<MockDocsRsClient>,
+    oidc_key_stores: HashMap<String, Box<dyn OidcKeyStore>>,
+    og_image_generator: Option<OgImageGenerator>,
 }
 
 impl TestAppBuilder {
-    /// Create a `TestApp` with an empty database
+    /// Creates a `TestApp` with an empty database
     pub async fn empty(mut self) -> (TestApp, MockAnonymousUser) {
         // Run each test inside a fresh database schema, deleted at the end of the test,
         // The schema will be cleared up once the app is dropped.
@@ -280,16 +336,22 @@ impl TestAppBuilder {
             (primary_proxy, replica_proxy)
         };
 
-        let (app, router) = build_app(self.config, self.github);
+        let github: Arc<dyn GitHubClient> = match self.github {
+            Some(github) => Arc::new(github),
+            None => Arc::new(MOCK_GITHUB_DATA.as_mock_client()),
+        };
+
+        let (app, router) = build_app(self.config, Arc::clone(&github), self.oidc_key_stores);
 
         let runner = if self.build_job_runner {
-            let index = self
-                .index
-                .as_ref()
-                .expect("Index must be initialized to build a job runner");
+            let index_location = self
+                .index_location
+                .clone()
+                .or_else(|| self.index.as_ref().map(|i| i.url()))
+                .unwrap_or_else(|| Url::parse("file:///nonexistent").unwrap());
 
             let repository_config = RepositoryConfig {
-                index_location: index.url(),
+                index_location,
                 credentials: Credentials::Missing,
             };
 
@@ -299,7 +361,12 @@ impl TestAppBuilder {
                 .storage(app.storage.clone())
                 .deadpool(app.primary_database.clone())
                 .emails(app.emails.clone())
+                .maybe_docs_rs(self.docs_rs.map(|cl| Box::new(cl) as _))
                 .team_repo(Box::new(self.team_repo))
+                .maybe_index_sync_github_app(self.index_sync_github_app.map(|a| Arc::new(a) as _))
+                .maybe_sync_github_app(self.sync_github_app.map(|a| Arc::new(a) as _))
+                .github(github)
+                .maybe_og_image_generator(self.og_image_generator)
                 .build();
 
             let runner = Runner::new(app.primary_database.clone(), Arc::new(environment))
@@ -334,7 +401,7 @@ impl TestAppBuilder {
         (app, anon, user)
     }
 
-    /// Create a `TestApp` with a database including a default user and its token
+    /// Creates a `TestApp` with a database including a default user and its token
     pub async fn with_token(self) -> (TestApp, MockAnonymousUser, MockCookieUser, MockTokenUser) {
         let (app, anon) = self.empty().await;
         let user = app.db_new_user("foo").await;
@@ -363,13 +430,24 @@ impl TestAppBuilder {
     pub fn with_rate_limit(self, action: LimitedAction, rate: Duration, burst: i32) -> Self {
         self.with_config(|config| {
             config
-                .rate_limiter
+                .rate_limits
+                .actions
                 .insert(action, RateLimiterConfig { rate, burst });
         })
     }
 
     pub fn with_git_index(mut self) -> Self {
         self.index = Some(UpstreamIndex::new().unwrap());
+        self.config.sync_git_index = true;
+        self
+    }
+
+    /// Override the `index_location` URL used for the worker
+    /// [`RepositoryConfig`]. Used by tests that exercise jobs which
+    /// parse the URL (e.g. [`crates_io::worker::jobs::SquashIndex`])
+    /// but do not touch the local bare repo.
+    pub fn with_index_location(mut self, url: Url) -> Self {
+        self.index_location = Some(url);
         self
     }
 
@@ -383,13 +461,51 @@ impl TestAppBuilder {
         self
     }
 
+    pub fn with_docs_rs(mut self, docs_rs: MockDocsRsClient) -> Self {
+        self.docs_rs = Some(docs_rs);
+        self
+    }
+
     pub fn with_github(mut self, github: MockGitHubClient) -> Self {
         self.github = Some(github);
         self
     }
 
+    /// Adds a new OIDC keystore to the application
+    pub fn with_oidc_keystore(
+        mut self,
+        issuer_url: impl Into<String>,
+        keystore: MockOidcKeyStore,
+    ) -> Self {
+        self.oidc_key_stores
+            .insert(issuer_url.into(), Box::new(keystore));
+        self
+    }
+
     pub fn with_team_repo(mut self, team_repo: MockTeamRepo) -> Self {
         self.team_repo = team_repo;
+        self
+    }
+
+    pub fn with_index_sync_github_app(
+        mut self,
+        index_sync_github_app: Option<MockGitHubApp>,
+    ) -> Self {
+        self.index_sync_github_app = index_sync_github_app;
+        self
+    }
+
+    pub fn with_sync_github_app(mut self, sync_github_app: Option<MockGitHubApp>) -> Self {
+        self.sync_github_app = sync_github_app;
+        self
+    }
+
+    pub fn with_og_image_generator(mut self) -> Self {
+        let og_generator = OgImageGenerator::from_environment()
+            .expect("Failed to create OG image generator for tests")
+            .with_oxipng();
+
+        self.og_image_generator = Some(og_generator);
         self
     }
 
@@ -401,6 +517,11 @@ impl TestAppBuilder {
             read_only_mode: true,
             pool_size: primary.pool_size,
             min_idle: primary.min_idle,
+            tcp_timeout: primary.tcp_timeout,
+            connection_timeout: primary.connection_timeout,
+            statement_timeout: primary.statement_timeout,
+            helper_threads: primary.helper_threads,
+            enforce_tls: primary.enforce_tls,
         });
 
         self
@@ -419,51 +540,49 @@ fn simple_config() -> config::Server {
             read_only_mode: false,
             pool_size: 5,
             min_idle: None,
+            tcp_timeout: Duration::from_secs(1),
+            connection_timeout: Duration::from_secs(1),
+            statement_timeout: Duration::from_secs(1),
+            helper_threads: 1,
+            enforce_tls: false,
         },
         replica: None,
-        tcp_timeout_ms: 1000, // 1 second
-        connection_timeout: Duration::from_secs(1),
-        statement_timeout: Duration::from_secs(1),
-        helper_threads: 1,
-        enforce_tls: false,
     };
 
     let mut storage = StorageConfig::in_memory();
     storage.cdn_prefix = Some("static.crates.io".to_string());
+    storage.cache_tags_enabled = true;
 
     config::Server {
         base,
-        ip: [127, 0, 0, 1].into(),
-        port: 8888,
+        bind: BindConfig {
+            ip: [127, 0, 0, 1].into(),
+            port: 8888,
+        },
         max_blocking_threads: None,
         db,
         storage,
         cdn_log_queue: CdnLogQueueConfig::Mock,
         cdn_log_storage: CdnLogStorageConfig::memory(),
         session_key: cookie::Key::derive_from("test this has to be over 32 bytes long".as_bytes()),
-        gh_client_id: ClientId::new(dotenvy::var("GH_CLIENT_ID").unwrap_or_default()),
-        gh_client_secret: ClientSecret::new(dotenvy::var("GH_CLIENT_SECRET").unwrap_or_default()),
-        max_upload_size: 128 * 1024, // 128 kB should be enough for most testing purposes
-        max_unpack_size: 128 * 1024, // 128 kB should be enough for most testing purposes
-        max_features: 10,
-        max_dependencies: 10,
-        rate_limiter: Default::default(),
-        new_version_rate_limit: Some(10),
-        blocked_traffic: Default::default(),
-        blocked_ips: Default::default(),
+        github_oauth: GitHubOAuthConfig {
+            client_id: ClientId::new(dotenvy::var("GH_CLIENT_ID").unwrap_or_default()),
+            client_secret: ClientSecret::new(dotenvy::var("GH_CLIENT_SECRET").unwrap_or_default()),
+        },
+        token_encryption: TokenEncryption::for_testing(),
+        publish_limits: PublishLimitsConfig::for_testing(),
+        rate_limits: RateLimitsConfig {
+            new_versions_daily: Some(10),
+            ..Default::default()
+        },
+        block: Default::default(),
         max_allowed_page_offset: 200,
-        page_offset_ua_blocklist: vec![],
-        page_offset_cidr_blocklist: vec![],
         excluded_crate_names: vec![],
         domain_name: "crates.io".into(),
         allowed_origins: Default::default(),
-        downloads_persist_interval: Duration::from_secs(1),
         ownership_invitations_expiration: chrono::Duration::days(30),
-        metrics_authorization_token: None,
-        instance_metrics_log_every_seconds: None,
-        blocked_routes: HashSet::new(),
-        version_id_cache_size: 10000,
-        version_id_cache_ttl: Duration::from_secs(5 * 60),
+        metrics: Default::default(),
+        datadog: DatadogConfig::default(),
         cdn_user_agent: "Amazon CloudFront".to_string(),
 
         // The middleware has its own unit tests to verify its functionality.
@@ -472,25 +591,48 @@ fn simple_config() -> config::Server {
         cargo_compat_status_code_config: StatusCodeConfig::Disabled,
 
         // The frontend code is not needed for the backend tests.
-        serve_dist: false,
-        serve_html: false,
-        og_image_base_url: None,
-        html_render_cache_max_capacity: 1024,
-        content_security_policy: None,
+        frontend: FrontendConfig {
+            serve_dist: false,
+            serve_html: false,
+            html_render_cache_max_capacity: 1024,
+        },
+        trustpub_audience: AUDIENCE.to_string(),
+        disable_token_creation: None,
+        banner_message: None,
+        features: FeaturesConfig {
+            index_include_pubtime: false,
+            zip_archives_enabled: true,
+            cache_tags_enabled: true,
+            cache_tag_invalidations_enabled: true,
+        },
+        fastly: None,
+        sync_git_index: false,
+        index_archive_url: None,
+        postgres_bin_dir: None,
     }
 }
 
-fn build_app(config: config::Server, github: Option<MockGitHubClient>) -> (Arc<App>, axum::Router) {
+fn build_app(
+    config: config::Server,
+    github: Arc<dyn GitHubClient>,
+    oidc_key_stores: HashMap<String, Box<dyn OidcKeyStore>>,
+) -> (Arc<App>, axum::Router) {
     // Use the in-memory email backend for all tests, allowing tests to analyze the emails sent by
     // the application. This will also prevent cluttering the filesystem.
     let emails = Emails::new_in_memory();
 
-    let github = github.unwrap_or_else(|| MOCK_GITHUB_DATA.as_mock_client());
-    let github = Box::new(github);
-
-    let app = App::new(config, emails, github);
+    let app = App::builder()
+        .databases_from_config(&config.db)
+        .github(github)
+        .github_oauth_from_config(&config)
+        .oidc_key_stores(oidc_key_stores)
+        .emails(emails)
+        .storage_from_config(&config.storage)
+        .rate_limiter_from_config(config.rate_limits.actions.clone())
+        .config(Arc::new(config))
+        .build();
 
     let app = Arc::new(app);
-    let router = crate::build_handler(Arc::clone(&app));
+    let router = crates_io::build_handler(Arc::clone(&app));
     (app, router)
 }

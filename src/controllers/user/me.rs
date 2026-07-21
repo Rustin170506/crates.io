@@ -1,18 +1,21 @@
-use crate::auth::AuthCheck;
-use axum::Json;
-use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
-use futures_util::FutureExt;
-use http::request::Parts;
-
 use crate::app::AppState;
+use crate::auth::AuthCheck;
 use crate::controllers::helpers::Paginate;
 use crate::controllers::helpers::pagination::{Paginated, PaginationOptions};
 use crate::models::krate::CrateName;
 use crate::models::{CrateOwner, Follow, OwnerKind, User, Version, VersionOwnerAction};
-use crate::schema::{crate_owners, crates, emails, follows, users, versions};
+use crate::schema::{crate_owners, crates, emails, follows, oauth_github, users, versions};
 use crate::util::errors::AppResult;
+use crate::util::no_store;
 use crate::views::{EncodableMe, EncodablePrivateUser, EncodableVersion, OwnedCrate};
+use axum::Json;
+use axum_extra::TypedHeader;
+use axum_extra::headers::CacheControl;
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use futures_util::FutureExt;
+use http::request::Parts;
+use serde::Serialize;
 
 /// Get the currently authenticated user.
 #[utoipa::path(
@@ -20,33 +23,46 @@ use crate::views::{EncodableMe, EncodablePrivateUser, EncodableVersion, OwnedCra
     path = "/api/v1/me",
     security(("cookie" = [])),
     tag = "users",
+    extensions(("x-internal" = json!(true))),
     responses((status = 200, description = "Successful Response", body = inline(EncodableMe))),
 )]
-pub async fn get_authenticated_user(app: AppState, req: Parts) -> AppResult<Json<EncodableMe>> {
+pub async fn get_authenticated_user(
+    app: AppState,
+    req: Parts,
+) -> AppResult<(TypedHeader<CacheControl>, Json<EncodableMe>)> {
     let mut conn = app.db_read_prefer_primary().await?;
     let user_id = AuthCheck::only_cookie()
         .check(&req, &mut conn)
         .await?
         .user_id();
 
+    Ok((no_store(), authenticated_user(&mut conn, user_id).await?))
+}
+
+/// Loads the profile of the user with the given id.
+pub async fn authenticated_user(
+    conn: &mut AsyncPgConnection,
+    user_id: i32,
+) -> AppResult<Json<EncodableMe>> {
     let ((user, verified, email, verification_sent), owned_crates) = tokio::try_join!(
         users::table
             .find(user_id)
             .left_join(emails::table)
+            .left_join(oauth_github::table)
             .select((
                 User::as_select(),
                 emails::verified.nullable(),
                 emails::email.nullable(),
                 emails::token_generated_at.nullable().is_not_null(),
             ))
-            .first::<(User, Option<bool>, Option<String>, bool)>(&mut conn)
+            .first::<(User, Option<bool>, Option<String>, bool)>(&mut &*conn)
             .boxed(),
         CrateOwner::by_owner_kind(OwnerKind::User)
             .inner_join(crates::table)
             .filter(crate_owners::owner_id.eq(user_id))
             .select((crates::id, crates::name, crate_owners::email_notifications))
             .order(crates::name.asc())
-            .load(&mut conn)
+            .load(&mut &*conn)
             .boxed()
     )?;
 
@@ -88,12 +104,13 @@ pub struct UpdatesResponseMeta {
     path = "/api/v1/me/updates",
     security(("cookie" = [])),
     tag = "versions",
+    extensions(("x-internal" = json!(true))),
     responses((status = 200, description = "Successful Response", body = inline(UpdatesResponse))),
 )]
 pub async fn get_authenticated_user_updates(
     app: AppState,
     req: Parts,
-) -> AppResult<Json<UpdatesResponse>> {
+) -> AppResult<(TypedHeader<CacheControl>, Json<UpdatesResponse>)> {
     let mut conn = app.db_read_prefer_primary().await?;
     let auth = AuthCheck::only_cookie().check(&req, &mut conn).await?;
 
@@ -102,7 +119,7 @@ pub async fn get_authenticated_user_updates(
     let followed_crates = Follow::belonging_to(user).select(follows::crate_id);
     let query = versions::table
         .inner_join(crates::table)
-        .left_outer_join(users::table)
+        .left_outer_join(users::table.left_join(oauth_github::table))
         .filter(crates::id.eq_any(followed_crates))
         .order(versions::created_at.desc())
         .select(<(Version, CrateName, Option<User>)>::as_select())
@@ -112,7 +129,7 @@ pub async fn get_authenticated_user_updates(
 
     let more = data.next_page_params().is_some();
     let versions = data.iter().map(|(v, ..)| v).collect::<Vec<_>>();
-    let actions = VersionOwnerAction::for_versions(&mut conn, &versions).await?;
+    let actions = VersionOwnerAction::for_versions(&conn, &versions).await?;
     let data = data
         .into_iter()
         .zip(actions)
@@ -125,8 +142,11 @@ pub async fn get_authenticated_user_updates(
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(UpdatesResponse {
-        versions,
-        meta: UpdatesResponseMeta { more },
-    }))
+    Ok((
+        no_store(),
+        Json(UpdatesResponse {
+            versions,
+            meta: UpdatesResponseMeta { more },
+        }),
+    ))
 }

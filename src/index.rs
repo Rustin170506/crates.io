@@ -9,17 +9,18 @@ use crates_io_index::features::split_features;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sentry::Level;
+use tracing::{debug, instrument};
 
 #[instrument(skip_all, fields(krate.name = ?name))]
 pub async fn get_index_data(
     name: &str,
     conn: &mut AsyncPgConnection,
+    include_pubtime: bool,
 ) -> anyhow::Result<Option<String>> {
     debug!("Looking up crate by name");
-    let krate = crates::table
-        .select(Crate::as_select())
+    let krate = Crate::query()
         .filter(crates::name.eq(name))
-        .first::<Crate>(conn)
+        .first(conn)
         .await
         .optional();
 
@@ -28,7 +29,7 @@ pub async fn get_index_data(
     };
 
     debug!("Gathering remaining index data");
-    let crates = index_metadata(&krate, conn)
+    let crates = index_metadata(&krate, conn, include_pubtime)
         .await
         .context("Failed to gather index metadata")?;
 
@@ -54,10 +55,11 @@ pub async fn get_index_data(
     Ok(Some(str))
 }
 
-/// Gather all the necessary data to write an index metadata file
+/// Gathers all the necessary data to write an index metadata file.
 pub async fn index_metadata(
     krate: &Crate,
     conn: &mut AsyncPgConnection,
+    include_pubtime: bool,
 ) -> QueryResult<Vec<crates_io_index::Crate>> {
     let mut versions: Vec<Version> = Version::belonging_to(krate)
         .select(Version::as_select())
@@ -121,12 +123,13 @@ pub async fn index_metadata(
             let krate = crates_io_index::Crate {
                 name: krate.name.clone(),
                 vers: version.num.to_string(),
-                cksum: version.checksum,
+                cksum: hex::encode(version.tar_sha256),
                 yanked: Some(version.yanked),
                 deps,
                 features,
                 links: version.links,
                 rust_version: version.rust_version,
+                pubtime: include_pubtime.then_some(version.created_at),
                 features2,
                 v,
             };
@@ -139,10 +142,9 @@ pub async fn index_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::users;
-    use crate::tests::builders::{CrateBuilder, VersionBuilder};
     use chrono::{Days, Utc};
     use crates_io_test_db::TestDatabase;
+    use crates_io_test_utils::builders::{CrateBuilder, UserBuilder, VersionBuilder};
     use insta::assert_json_snapshot;
 
     #[tokio::test]
@@ -150,15 +152,10 @@ mod tests {
         let test_db = TestDatabase::new();
         let mut conn = test_db.async_connect().await;
 
-        let user_id = diesel::insert_into(users::table)
-            .values((
-                users::name.eq("user1"),
-                users::gh_login.eq("user1"),
-                users::gh_id.eq(42),
-                users::gh_access_token.eq("some random token"),
-            ))
-            .returning(users::id)
-            .get_result::<i32>(&mut conn)
+        let user_id = UserBuilder::new()
+            .with_username("user1")
+            .new_user()
+            .insert(&conn)
             .await
             .unwrap();
 
@@ -170,7 +167,7 @@ mod tests {
             .expect_build(&mut conn)
             .await;
 
-        let metadata = index_metadata(&fooo, &mut conn).await.unwrap();
+        let metadata = index_metadata(&fooo, &mut conn, false).await.unwrap();
         assert_json_snapshot!(metadata);
 
         let bar = CrateBuilder::new("bar", user_id)
@@ -185,11 +182,39 @@ mod tests {
                     .created_at(created_at_2)
                     .dependency(&fooo, None),
             )
-            .version(VersionBuilder::new("1.0.1").checksum("0123456789abcdef"))
+            .version(
+                VersionBuilder::new("1.0.1")
+                    .checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            )
             .expect_build(&mut conn)
             .await;
 
-        let metadata = index_metadata(&bar, &mut conn).await.unwrap();
+        let metadata = index_metadata(&bar, &mut conn, false).await.unwrap();
+        assert_json_snapshot!(metadata);
+    }
+
+    #[tokio::test]
+    async fn test_index_metadata_with_pubtime() {
+        let test_db = TestDatabase::new();
+        let mut conn = test_db.async_connect().await;
+
+        let user_id = UserBuilder::new()
+            .with_username("user1")
+            .new_user()
+            .insert(&conn)
+            .await
+            .unwrap();
+
+        let v1 = VersionBuilder::new("1.0.0").created_at("2020-01-01T00:00:00Z".parse().unwrap());
+        let v2 = VersionBuilder::new("2.0.0").created_at("2020-02-01T00:00:00Z".parse().unwrap());
+
+        let bar = CrateBuilder::new("bar", user_id)
+            .version(v1)
+            .version(v2)
+            .expect_build(&mut conn)
+            .await;
+
+        let metadata = index_metadata(&bar, &mut conn, true).await.unwrap();
         assert_json_snapshot!(metadata);
     }
 }

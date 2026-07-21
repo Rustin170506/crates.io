@@ -1,13 +1,14 @@
-use crate::tests::builders::CrateBuilder;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::CrateBuilder;
+use crate::util::{RequestHelper, TestApp};
+use insta::assert_snapshot;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn diesel_not_found_results_in_404() {
     let (_, _, user) = TestApp::init().with_user().await;
-
-    user.get("/api/v1/crates/foo_following/following")
-        .await
-        .assert_not_found();
+    let response = user
+        .get::<()>("/api/v1/crates/foo_following/following")
+        .await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -23,8 +24,8 @@ async fn disallow_api_token_auth_for_get_crate_following_status() {
         .await;
 
     // Token auth on GET for get following status is disallowed
-    token
-        .get(&format!("/api/v1/crates/{a_crate}/following"))
-        .await
-        .assert_forbidden();
+    let response = token
+        .get::<()>(&format!("/api/v1/crates/{a_crate}/following"))
+        .await;
+    assert_snapshot!(response.status(), @"403 Forbidden");
 }

@@ -1,14 +1,14 @@
 use crate::models::{Crate, Version};
+use crate::pg_enum;
 use crate::schema::*;
-use crates_io_diesel_helpers::pg_enum;
 use crates_io_index::DependencyKind as IndexDependencyKind;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Text};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use tracing::instrument;
 
-#[derive(Identifiable, Associations, Debug, Queryable, QueryableByName, Selectable)]
+#[derive(Identifiable, Associations, Debug, HasQuery, QueryableByName)]
 #[diesel(
     table_name = dependencies,
-    check_for_backend(diesel::pg::Pg),
     belongs_to(Version),
     belongs_to(Crate),
 )]
@@ -25,14 +25,52 @@ pub struct Dependency {
     pub explicit_name: Option<String>,
 }
 
-#[derive(Debug, QueryableByName)]
+#[derive(Debug, HasQuery)]
+#[diesel(
+    base_query = reverse_dependencies::table
+        .inner_join(crates::table.on(crates::id.eq(reverse_dependencies::dependent_crate_id)))
+        .inner_join(dependencies::table.on(dependencies::id.eq(reverse_dependencies::dependency_id)))
+)]
 pub struct ReverseDependency {
     #[diesel(embed)]
     pub dependency: Dependency,
-    #[diesel(sql_type = BigInt)]
+    #[diesel(select_expression = reverse_dependencies::dependent_downloads)]
     pub crate_downloads: i64,
-    #[diesel(sql_type = Text, column_name = crate_name)]
+    #[diesel(select_expression = crates::name)]
     pub name: String,
+}
+
+impl ReverseDependency {
+    /// Returns a page of reverse dependencies, ordered by the dependent crate's
+    /// total downloads.
+    #[instrument(skip_all, fields(crate_id))]
+    pub async fn page_for_crate(
+        crate_id: i32,
+        mut conn: &AsyncPgConnection,
+        offset: i64,
+        limit: i64,
+    ) -> QueryResult<Vec<Self>> {
+        Self::query()
+            .filter(reverse_dependencies::target_crate_id.eq(crate_id))
+            .order((
+                reverse_dependencies::dependent_downloads.desc(),
+                reverse_dependencies::dependent_crate_id.desc(),
+            ))
+            .offset(offset)
+            .limit(limit)
+            .load(&mut conn)
+            .await
+    }
+
+    /// Returns the total number of reverse dependencies for the crate.
+    #[instrument(skip_all, fields(crate_id))]
+    pub async fn count_for_crate(crate_id: i32, mut conn: &AsyncPgConnection) -> QueryResult<i64> {
+        reverse_dependencies::table
+            .filter(reverse_dependencies::target_crate_id.eq(crate_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+    }
 }
 
 pg_enum! {

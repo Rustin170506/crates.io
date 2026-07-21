@@ -1,0 +1,67 @@
+import { test } from 'vitest';
+
+import { db } from '../index.js';
+
+test('throws if `crate` is not set', async ({ expect }) => {
+  // @ts-expect-error: missing required field
+  await expect(() => db.version.create({})).rejects.toThrowErrorMatchingInlineSnapshot(
+    `[Error: Failed to create a new record with initial values: does not match the schema. Please see the schema validation errors above.]`,
+  );
+});
+
+test('happy path', async ({ expect }) => {
+  let crate = await db.crate.create({});
+  let version = await db.version.create({ crate });
+  expect(version).toMatchInlineSnapshot(`
+    {
+      "crate": {
+        "_extra_downloads": [],
+        "badges": [],
+        "categories": [],
+        "created_at": "2010-06-16T21:30:45Z",
+        "description": "This is the description for the crate called "crate-1"",
+        "documentation": null,
+        "downloads": 37035,
+        "homepage": null,
+        "id": 1,
+        "keywords": [],
+        "name": "crate-1",
+        "recent_downloads": 321,
+        "repository": null,
+        "trustpubOnly": false,
+        "updated_at": "2017-02-24T12:34:56Z",
+      },
+      "crate_size": 162963,
+      "created_at": "2010-06-16T21:30:45Z",
+      "downloads": 3702,
+      "features": {},
+      "id": 1,
+      "license": "MIT",
+      "linecounts": {
+        "languages": {
+          "JavaScript": {
+            "code_lines": 325,
+            "comment_lines": 80,
+            "files": 8,
+          },
+          "TypeScript": {
+            "code_lines": 195,
+            "comment_lines": 10,
+            "files": 2,
+          },
+        },
+        "total_code_lines": 520,
+        "total_comment_lines": 90,
+      },
+      "num": "1.0.0",
+      "publishedBy": null,
+      "readme": null,
+      "rust_version": null,
+      "source_files": null,
+      "trustpub_data": null,
+      "updated_at": "2017-02-24T12:34:56Z",
+      "yank_message": null,
+      "yanked": false,
+    }
+  `);
+});

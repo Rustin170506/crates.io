@@ -1,4 +1,4 @@
-use crate::models::Crate;
+use crates_io_validation::validate_crate_name;
 use diesel::deserialize::{self, FromSql};
 use diesel::pg::Pg;
 use diesel::serialize::{self, IsNull, Output, ToSql};
@@ -13,6 +13,7 @@ use std::io::Write;
 pub enum EndpointScope {
     PublishNew,
     PublishUpdate,
+    TrustedPublishing,
     Yank,
     ChangeOwners,
 }
@@ -22,6 +23,7 @@ impl From<&EndpointScope> for &[u8] {
         match scope {
             EndpointScope::PublishNew => b"publish-new",
             EndpointScope::PublishUpdate => b"publish-update",
+            EndpointScope::TrustedPublishing => b"trusted-publishing",
             EndpointScope::Yank => b"yank",
             EndpointScope::ChangeOwners => b"change-owners",
         }
@@ -42,6 +44,7 @@ impl TryFrom<&[u8]> for EndpointScope {
         match bytes {
             b"publish-new" => Ok(EndpointScope::PublishNew),
             b"publish-update" => Ok(EndpointScope::PublishUpdate),
+            b"trusted-publishing" => Ok(EndpointScope::TrustedPublishing),
             b"yank" => Ok(EndpointScope::Yank),
             b"change-owners" => Ok(EndpointScope::ChangeOwners),
             _ => Err("Unrecognized enum variant".to_string()),
@@ -110,7 +113,7 @@ impl CrateScope {
         }
 
         let name_without_wildcard = pattern.strip_suffix('*').unwrap_or(pattern);
-        Crate::validate_crate_name("crate", name_without_wildcard).is_ok()
+        validate_crate_name("crate", name_without_wildcard).is_ok()
     }
 
     pub fn matches(&self, crate_name: &str) -> bool {
@@ -140,6 +143,7 @@ mod tests {
         assert(EndpointScope::ChangeOwners, "\"change-owners\"");
         assert(EndpointScope::PublishNew, "\"publish-new\"");
         assert(EndpointScope::PublishUpdate, "\"publish-update\"");
+        assert(EndpointScope::TrustedPublishing, "\"trusted-publishing\"");
         assert(EndpointScope::Yank, "\"yank\"");
     }
 

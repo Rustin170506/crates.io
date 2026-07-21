@@ -1,17 +1,14 @@
-use crate::tests::builders::CrateBuilder;
-use crate::tests::util::TestApp;
-use crate::worker::jobs::DumpDb;
+use crate::builders::CrateBuilder;
+use crate::util::TestApp;
 use bytes::Buf;
+use crates_io::worker::jobs::DumpDb;
 use crates_io_worker::BackgroundJob;
 use flate2::read::GzDecoder;
 use insta::{assert_debug_snapshot, assert_snapshot};
-use regex::Regex;
+use object_store::ObjectStoreExt;
+use regex::regex;
 use std::io::{Cursor, Read};
-use std::sync::LazyLock;
 use tar::Archive;
-
-static PATH_DATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{6}").unwrap());
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dump_db_job() -> anyhow::Result<()> {
@@ -22,7 +19,7 @@ async fn test_dump_db_job() -> anyhow::Result<()> {
         .expect_build(&mut conn)
         .await;
 
-    DumpDb.enqueue(&mut conn).await?;
+    DumpDb::for_schema(app.db_schema()).enqueue(&conn).await?;
 
     app.run_pending_background_jobs().await;
 
@@ -53,12 +50,15 @@ async fn test_dump_db_job() -> anyhow::Result<()> {
         "YYYY-MM-DD-HHMMSS/data/crates.csv",
         "YYYY-MM-DD-HHMMSS/data/keywords.csv",
         "YYYY-MM-DD-HHMMSS/data/metadata.csv",
+        "YYYY-MM-DD-HHMMSS/data/oauth_github.csv",
         "YYYY-MM-DD-HHMMSS/data/reserved_crate_names.csv",
+        "YYYY-MM-DD-HHMMSS/data/reserved_usernames.csv",
         "YYYY-MM-DD-HHMMSS/data/teams.csv",
         "YYYY-MM-DD-HHMMSS/data/users.csv",
         "YYYY-MM-DD-HHMMSS/data/crates_categories.csv",
         "YYYY-MM-DD-HHMMSS/data/crates_keywords.csv",
         "YYYY-MM-DD-HHMMSS/data/crate_owners.csv",
+        "YYYY-MM-DD-HHMMSS/data/deleted_crates.csv",
         "YYYY-MM-DD-HHMMSS/data/versions.csv",
         "YYYY-MM-DD-HHMMSS/data/default_versions.csv",
         "YYYY-MM-DD-HHMMSS/data/dependencies.csv",
@@ -85,12 +85,15 @@ async fn test_dump_db_job() -> anyhow::Result<()> {
         "data/crates.csv",
         "data/keywords.csv",
         "data/metadata.csv",
+        "data/oauth_github.csv",
         "data/reserved_crate_names.csv",
+        "data/reserved_usernames.csv",
         "data/teams.csv",
         "data/users.csv",
         "data/crates_categories.csv",
         "data/crates_keywords.csv",
         "data/crate_owners.csv",
+        "data/deleted_crates.csv",
         "data/versions.csv",
         "data/default_versions.csv",
         "data/dependencies.csv",
@@ -102,10 +105,12 @@ async fn test_dump_db_job() -> anyhow::Result<()> {
 }
 
 fn tar_paths<R: Read>(archive: &mut Archive<R>) -> Vec<String> {
+    let path_date_re = regex!(r"^\d{4}-\d{2}-\d{2}-\d{6}");
+
     archive
         .entries()
         .unwrap()
         .map(|entry| entry.unwrap().path().unwrap().display().to_string())
-        .map(|path| PATH_DATE_RE.replace(&path, "YYYY-MM-DD-HHMMSS").to_string())
+        .map(|path| path_date_re.replace(&path, "YYYY-MM-DD-HHMMSS").to_string())
         .collect()
 }

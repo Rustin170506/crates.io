@@ -1,16 +1,18 @@
 use std::{collections::BTreeSet, sync::Arc};
 
+use crate::worker::Environment;
 use anyhow::Context;
+use crates_io_database::models::CloudFrontDistribution;
 use crates_io_worker::BackgroundJob;
 use futures_util::TryStreamExt;
-use object_store::{ObjectMeta, ObjectStore};
-
-use crate::worker::Environment;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 const INDEX_PATH: &str = "archive/version-downloads/index.html";
 const INDEX_JSON_PATH: &str = "archive/version-downloads/index.json";
 
-/// Generate an index.html for the version download CSVs exported to S3.
+/// Generates `index.html` and `index.json` for the version download CSVs exported to S3.
 #[derive(Serialize, Deserialize, Default)]
 pub struct IndexVersionDownloadsArchive;
 
@@ -53,12 +55,19 @@ impl BackgroundJob for IndexVersionDownloadsArchive {
         info!("index.json generated and uploaded");
 
         info!("Invalidating CDN caches…");
-        if let Err(error) = env.invalidate_cdns(INDEX_PATH).await {
+        let conn = env.deadpool.get().await?;
+        let dist = CloudFrontDistribution::Static;
+
+        let result = env.invalidate_cdns(&conn, dist, INDEX_PATH).await;
+        if let Err(error) = result {
             warn!("Failed to invalidate CDN caches: {error}");
         }
-        if let Err(error) = env.invalidate_cdns(INDEX_JSON_PATH).await {
+
+        let result = env.invalidate_cdns(&conn, dist, INDEX_JSON_PATH);
+        if let Err(error) = result.await {
             warn!("Failed to invalidate CDN caches: {error}");
         }
+
         info!("CDN caches invalidated");
 
         info!("Finished indexing old version downloads");
@@ -66,7 +75,7 @@ impl BackgroundJob for IndexVersionDownloadsArchive {
     }
 }
 
-/// Generate and upload an index.html based on the objects within the given store.
+/// Generates and uploads an index.html based on the objects within the given store.
 async fn generate_html(store: &impl ObjectStore, files: &FileSet) -> anyhow::Result<()> {
     let index = files.to_html().context("rendering template")?;
 
@@ -78,7 +87,7 @@ async fn generate_html(store: &impl ObjectStore, files: &FileSet) -> anyhow::Res
     Ok(())
 }
 
-/// Generate and upload an index.json based on the objects within the given store.
+/// Generates and uploads an index.json based on the objects within the given store.
 async fn generate_json(store: &impl ObjectStore, files: &FileSet) -> anyhow::Result<()> {
     let content = serde_json::to_string(files)?;
 

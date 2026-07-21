@@ -5,7 +5,6 @@ use chrono::{DateTime, Utc};
 use diesel::dsl::now;
 use diesel::prelude::*;
 use diesel::sql_types::Timestamptz;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 pub use self::scopes::{CrateScope, EndpointScope};
@@ -29,19 +28,17 @@ pub struct NewApiToken {
 }
 
 impl NewApiToken {
-    pub async fn insert(&self, conn: &mut AsyncPgConnection) -> QueryResult<ApiToken> {
+    pub async fn insert(&self, mut conn: &AsyncPgConnection) -> QueryResult<ApiToken> {
         diesel::insert_into(api_tokens::table)
             .values(self)
             .returning(ApiToken::as_returning())
-            .get_result(conn)
+            .get_result(&mut conn)
             .await
     }
 }
 
 /// The model representing a row in the `api_tokens` database table.
-#[derive(
-    Debug, Identifiable, Queryable, Selectable, Associations, serde::Serialize, utoipa::ToSchema,
-)]
+#[derive(Debug, Identifiable, HasQuery, Associations, serde::Serialize, utoipa::ToSchema)]
 #[diesel(belongs_to(User))]
 pub struct ApiToken {
     /// An opaque unique identifier for the token.
@@ -96,15 +93,12 @@ impl ApiToken {
         // If the database is in read only mode, we can't update last_used_at.
         // Try updating in a new transaction, if that fails, fall back to reading
         let token = conn
-            .transaction(|conn| {
-                async move {
-                    diesel::update(tokens)
-                        .set(api_tokens::last_used_at.eq(now.into_sql::<Timestamptz>().nullable()))
-                        .returning(ApiToken::as_returning())
-                        .get_result(conn)
-                        .await
-                }
-                .scope_boxed()
+            .transaction(async |conn| {
+                diesel::update(tokens)
+                    .set(api_tokens::last_used_at.eq(now.into_sql::<Timestamptz>().nullable()))
+                    .returning(ApiToken::as_returning())
+                    .get_result(conn)
+                    .await
             })
             .await;
         let Ok(_) = token else {
@@ -145,8 +139,9 @@ mod tests {
         };
         let json = serde_json::to_string(&tok).unwrap();
         assert_some!(json.as_str().find(r#""created_at":"2017-01-06T14:23:11Z""#));
-        assert_some!(json
-            .as_str()
-            .find(r#""last_used_at":"2017-01-06T14:23:12Z""#));
+        assert_some!(
+            json.as_str()
+                .find(r#""last_used_at":"2017-01-06T14:23:12Z""#)
+        );
     }
 }

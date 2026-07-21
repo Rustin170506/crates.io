@@ -1,14 +1,15 @@
-use crate::models::token::{CrateScope, EndpointScope, NewApiToken};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::util::{RequestHelper, TestApp};
 use chrono::{Duration, Utc};
-use http::StatusCode;
-use insta::assert_json_snapshot;
+use claims::assert_ok;
+use crates_io::models::token::{CrateScope, EndpointScope, NewApiToken};
+use insta::{assert_json_snapshot, assert_snapshot};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn show_token_non_existing() {
     let url = "/api/v1/me/tokens/10086";
     let (_, _, user, _) = TestApp::init().with_token().await;
-    user.get(url).await.assert_not_found();
+    let response = user.get::<()>(url).await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -17,7 +18,7 @@ async fn show() {
     let token = token.as_model();
     let url = format!("/api/v1/me/tokens/{}", token.id);
     let response = user.get::<()>(&url).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".api_token.created_at" => "[datetime]",
     });
@@ -26,12 +27,12 @@ async fn show() {
 #[tokio::test(flavor = "multi_thread")]
 async fn show_token_with_scopes() {
     let (app, _, user) = TestApp::init().with_user().await;
-    let mut conn = app.db_conn().await;
+    let conn = app.db_conn().await;
     let user_model = user.as_model();
     let id = user_model.id;
 
     let new_token = NewApiToken::builder().name("bar").user_id(id).build();
-    assert_ok!(new_token.insert(&mut conn).await);
+    assert_ok!(new_token.insert(&conn).await);
 
     let new_token = NewApiToken::builder()
         .name("baz")
@@ -43,11 +44,11 @@ async fn show_token_with_scopes() {
         .endpoint_scopes(vec![EndpointScope::PublishUpdate])
         .expired_at(Utc::now() - Duration::days(31))
         .build();
-    let token = assert_ok!(new_token.insert(&mut conn).await);
+    let token = assert_ok!(new_token.insert(&conn).await);
 
     let url = format!("/api/v1/me/tokens/{}", token.id);
     let response = user.get::<()>(&url).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".api_token.created_at" => "[datetime]",
         ".api_token.expired_at" => "[datetime]",
@@ -58,20 +59,21 @@ async fn show_token_with_scopes() {
 async fn show_with_anonymous_user() {
     let url = "/api/v1/me/tokens/1";
     let (_, anon) = TestApp::init().empty().await;
-    anon.get(url).await.assert_forbidden();
+    let response = anon.get::<()>(url).await;
+    assert_snapshot!(response.status(), @"403 Forbidden");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn show_other_user_token() {
     let (app, _, user1) = TestApp::init().with_user().await;
-    let mut conn = app.db_conn().await;
+    let conn = app.db_conn().await;
     let user2 = app.db_new_user("baz").await;
     let user2 = user2.as_model();
 
     let new_token = NewApiToken::builder().name("bar").user_id(user2.id).build();
-    let token = assert_ok!(new_token.insert(&mut conn).await);
+    let token = assert_ok!(new_token.insert(&conn).await);
 
     let url = format!("/api/v1/me/tokens/{}", token.id);
     let response = user1.get::<()>(&url).await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
 }

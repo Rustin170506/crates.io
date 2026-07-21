@@ -1,0 +1,379 @@
+<script lang="ts">
+  import { resolve } from '$app/paths';
+  import { format } from 'date-fns/format';
+
+  import { getSession } from '$lib/utils/session.svelte';
+  import ColorSchemeMenu from './ColorSchemeMenu.svelte';
+  import * as Dropdown from './dropdown';
+  import Icon from './Icon.svelte';
+  import LoadingSpinner from './LoadingSpinner.svelte';
+  import SearchForm from './SearchForm.svelte';
+  import UserAvatar from './UserAvatar.svelte';
+
+  const SUDO_SESSION_DURATION_MS = 6 * 60 * 60 * 1000;
+
+  interface Props {
+    hero?: boolean;
+  }
+
+  let { hero = false }: Props = $props();
+
+  let session = getSession();
+
+  let currentUser = $derived(session.currentUser);
+  let isLoggingIn = $derived(session.state === 'logging-in');
+  let isLoggingOut = $derived(session.state === 'logging-out');
+  let isSudoEnabled = $derived(session.isSudoEnabled);
+  let sudoEnabledUntil = $derived(session.sudoEnabledUntil);
+
+  function enableSudo() {
+    session.setSudo(SUDO_SESSION_DURATION_MS);
+  }
+
+  function disableSudo() {
+    session.setSudo(0);
+  }
+</script>
+
+<header class="header" class:hero>
+  <div class="header-inner">
+    <a href={resolve('/')} class="index-link">
+      <enhanced:img src="$lib/assets/cargo.png?w=38;76;114" role="none" alt="" class="logo" sizes="38px" />
+      crates.io
+    </a>
+
+    <div class="search-form">
+      <h1 class="hero-title">The Rust community&rsquo;s crate registry</h1>
+
+      <SearchForm size={hero ? 'big' : undefined} autofocus={hero} />
+    </div>
+
+    <nav class="nav">
+      <ColorSchemeMenu class="color-scheme-menu" />
+
+      {#if currentUser}
+        <Dropdown.Root data-test-user-menu>
+          <Dropdown.Trigger class="button-reset" data-test-toggle>
+            {#if isSudoEnabled}
+              <span class="sr-only">Admin mode active</span>
+              <div class="wizard-hat" aria-hidden="true" data-test-wizard-hat>🧙</div>
+            {/if}
+
+            <UserAvatar
+              user={{ ...currentUser, kind: 'user' }}
+              size="small"
+              style="margin-right: var(--space-2xs);"
+              aria-hidden="true"
+              data-test-avatar
+            />
+
+            {currentUser.name}
+          </Dropdown.Trigger>
+
+          <Dropdown.Menu class="current-user-links">
+            <Dropdown.Item>
+              <a href={resolve('/users/[user_id]', { user_id: currentUser.login })}>Profile</a>
+            </Dropdown.Item>
+            <Dropdown.Item><a href={resolve('/dashboard')}>Dashboard</a></Dropdown.Item>
+            <Dropdown.Item><a href={resolve('/settings')} data-test-settings>Account Settings</a></Dropdown.Item>
+            <Dropdown.Item><a href={resolve('/me/pending-invites')}>Owner Invites</a></Dropdown.Item>
+            {#if currentUser?.is_admin}
+              <Dropdown.Item class="sudo">
+                {#if isSudoEnabled}
+                  <button
+                    type="button"
+                    class="sudo-menu-item button-reset"
+                    data-test-disable-admin-actions
+                    onclick={disableSudo}
+                  >
+                    Disable admin actions
+                    <div class="expires-in">expires at {sudoEnabledUntil ? format(sudoEnabledUntil, 'HH:mm') : ''}</div>
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    class="sudo-menu-item button-reset"
+                    data-test-enable-admin-actions
+                    onclick={enableSudo}
+                  >
+                    Enable admin actions
+                  </button>
+                {/if}
+              </Dropdown.Item>
+            {/if}
+            <Dropdown.Item style="border-top: 1px solid var(--gray-border)">
+              <button
+                type="button"
+                class="logout-menu-item button-reset"
+                disabled={isLoggingOut}
+                data-test-logout-button
+                onclick={() => session.logout()}
+              >
+                {#if isLoggingOut}
+                  <LoadingSpinner class="spinner" />
+                {/if}
+                Sign Out
+              </button>
+            </Dropdown.Item>
+          </Dropdown.Menu>
+        </Dropdown.Root>
+      {:else}
+        <button
+          type="button"
+          class="login-button button-reset"
+          disabled={isLoggingIn}
+          data-test-login-button
+          onclick={() => session.login()}
+        >
+          {#if isLoggingIn}
+            <LoadingSpinner class="spinner" />
+          {:else}
+            <Icon class="i-mdi:lock" />
+          {/if}
+          Log in with GitHub
+        </button>
+      {/if}
+    </nav>
+
+    <div class="menu">
+      <ColorSchemeMenu class="color-scheme-menu" />
+
+      <Dropdown.Root>
+        <Dropdown.Trigger class="button-reset">Menu</Dropdown.Trigger>
+        <Dropdown.Menu class="current-user-links">
+          {#if currentUser}
+            <Dropdown.Item>
+              <a href={resolve('/users/[user_id]', { user_id: currentUser.login })}>Profile</a>
+            </Dropdown.Item>
+            <Dropdown.Item><a href={resolve('/dashboard')}>Dashboard</a></Dropdown.Item>
+            <Dropdown.Item><a href={resolve('/settings')} data-test-me-link>Account Settings</a></Dropdown.Item>
+            <Dropdown.Item><a href={resolve('/me/pending-invites')}>Owner Invites</a></Dropdown.Item>
+            <Dropdown.Item style="border-top: 1px solid var(--gray-border)">
+              <button
+                type="button"
+                class="logout-menu-item button-reset"
+                disabled={isLoggingOut}
+                onclick={() => session.logout()}
+              >
+                {#if isLoggingOut}
+                  <LoadingSpinner class="spinner" />
+                {/if}
+                Sign Out
+              </button>
+            </Dropdown.Item>
+          {:else}
+            <Dropdown.Item>
+              <button
+                type="button"
+                class="login-menu-item button-reset"
+                disabled={isLoggingIn}
+                onclick={() => session.login()}
+              >
+                {#if isLoggingIn}
+                  <LoadingSpinner class="spinner" />
+                {/if}
+                Log in with GitHub
+              </button>
+            </Dropdown.Item>
+          {/if}
+        </Dropdown.Menu>
+      </Dropdown.Root>
+    </div>
+  </div>
+</header>
+
+<style>
+  .header {
+    display: flex;
+    justify-content: center;
+    width: 100%;
+  }
+
+  .header-inner {
+    display: grid;
+    grid-template:
+      'logo search nav' auto /
+      1fr minmax(0, 600px) 1fr;
+    align-items: center;
+    column-gap: var(--space-m);
+    width: 100%;
+    padding: var(--space-xs) var(--space-m);
+    color: white;
+
+    & a {
+      color: white;
+      text-decoration: none;
+
+      &:hover {
+        color: white;
+      }
+    }
+
+    @media only screen and (max-width: 900px) {
+      grid-template:
+        'logo search menu' auto /
+        1fr minmax(0, 600px) 1fr;
+    }
+
+    @media only screen and (max-width: 820px) {
+      grid-template:
+        'logo menu' auto
+        'search search' auto /
+        auto 1fr;
+    }
+
+    .hero & {
+      grid-template:
+        'logo nav' auto
+        'search search' auto /
+        auto 1fr;
+
+      @media only screen and (max-width: 900px) {
+        grid-template:
+          'logo menu' auto
+          'search search' auto /
+          auto 1fr;
+      }
+    }
+  }
+
+  .index-link {
+    grid-area: logo;
+    display: flex;
+    align-items: center;
+    font-family: var(--font-heading);
+    font-size: var(--space-m);
+    font-weight: bold;
+  }
+
+  /* `enhanced:img` wraps the logo in a `<picture>`. This collapses it so the
+     `<img>` stays the direct flex child and remains vertically centered. */
+  .index-link > :global(picture) {
+    display: contents;
+  }
+
+  .logo {
+    width: auto;
+    height: calc(var(--space-m) * 1.4);
+    margin-right: var(--space-xs);
+  }
+
+  .search-form {
+    grid-area: search;
+    width: 100%;
+    max-width: 600px;
+    /* cap the width and center within the full-width header */
+    margin: 0 auto;
+
+    @media only screen and (max-width: 820px) {
+      margin: var(--space-s) auto;
+    }
+
+    .hero & {
+      padding: var(--space-l) 0 var(--space-l-xl);
+    }
+  }
+
+  .hero-title {
+    display: none;
+    margin: 0 0 var(--space-m);
+    font-size: var(--space-m-l);
+    text-align: center;
+    color: white;
+    text-shadow: 1px 3px 2px var(--green900);
+
+    .hero & {
+      display: block;
+    }
+  }
+
+  .nav {
+    grid-area: nav;
+    display: flex;
+    align-items: center;
+    justify-self: end;
+
+    @media only screen and (max-width: 900px) {
+      display: none;
+    }
+  }
+
+  .menu {
+    grid-area: menu;
+    justify-self: end;
+    display: none;
+
+    @media only screen and (max-width: 900px) {
+      display: flex;
+      align-items: center;
+    }
+  }
+
+  .header :global(.color-scheme-menu) {
+    margin-right: var(--space-xs);
+  }
+
+  .login-button {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    /* negative margin for larger click target */
+    margin: calc(var(--space-2xs) * -1);
+    padding: var(--space-2xs);
+    cursor: pointer;
+    --icon-size: 1.25em;
+
+    &:disabled {
+      cursor: wait;
+    }
+
+    & :global(.spinner) {
+      --spinner-color: white;
+      --spinner-bg-color: rgba(255, 255, 255, 0.2);
+
+      margin-right: var(--space-2xs);
+    }
+  }
+
+  .login-button :global(.icon) {
+    margin-right: var(--space-2xs);
+    opacity: 0.5;
+  }
+
+  .wizard-hat {
+    margin-right: var(--space-3xs);
+  }
+
+  .menu,
+  .nav {
+    & :global(.current-user-links) {
+      left: auto;
+      right: 0;
+      min-width: 200px;
+    }
+  }
+
+  .login-menu-item,
+  .logout-menu-item,
+  .sudo-menu-item {
+    cursor: pointer;
+
+    &:disabled {
+      cursor: wait;
+    }
+
+    & :global(.spinner) {
+      margin-right: var(--space-2xs);
+    }
+  }
+
+  .sudo-menu-item {
+    flex-direction: column;
+
+    > .expires-in {
+      font-size: 80%;
+      font-style: italic;
+      padding-top: var(--space-3xs);
+    }
+  }
+</style>

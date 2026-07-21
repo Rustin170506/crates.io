@@ -39,7 +39,7 @@ impl TopCrates {
         // data structure.
 
         let crates: BTreeMap<i32, (String, Crate)> = BTreeMap::new();
-        let crates = models::Crate::all()
+        let crates = models::Crate::query()
             .inner_join(crate_downloads::table)
             .order(crate_downloads::downloads.desc())
             .limit(num)
@@ -106,10 +106,17 @@ pub struct Crate {
 
 impl Crate {
     /// Hydrates a crate and its owners from the database given the crate name.
-    pub async fn from_name(conn: &mut AsyncPgConnection, name: &str) -> QueryResult<Self> {
+    pub async fn from_name(conn: &mut AsyncPgConnection, name: &str) -> QueryResult<Option<Self>> {
         use crate::models;
 
-        let krate = models::Crate::by_exact_name(name).first(conn).await?;
+        let Some(krate) = models::Crate::by_exact_name(name)
+            .first(conn)
+            .await
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
         let owners = krate
             .owners(conn)
             .await?
@@ -117,7 +124,7 @@ impl Crate {
             .map(Owner::from)
             .collect();
 
-        Ok(Self { owners })
+        Ok(Some(Self { owners }))
     }
 }
 
@@ -170,9 +177,9 @@ impl From<crate::models::Owner> for Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::add_team_to_crate;
     use crate::typosquat::test_util::faker;
     use crates_io_test_db::TestDatabase;
+    use crates_io_test_utils::helpers::add_team_to_crate;
     use thiserror::Error;
 
     #[tokio::test]
@@ -185,15 +192,14 @@ mod tests {
         let user_b = faker::user(&mut conn, "b").await?;
 
         // Set up three crates with various ownership schemes.
-        let _top_a = faker::crate_and_version(&mut conn, "a", "Hello", &user_a, 2).await?;
-        let top_b =
-            faker::crate_and_version(&mut conn, "b", "Yes, this is dog", &user_b, 1).await?;
-        let not_top_c = faker::crate_and_version(&mut conn, "c", "Unpopular", &user_a, 0).await?;
+        let _top_a = faker::crate_and_version(&mut conn, "a", "Hello", user_a, 2).await?;
+        let top_b = faker::crate_and_version(&mut conn, "b", "Yes, this is dog", user_b, 1).await?;
+        let not_top_c = faker::crate_and_version(&mut conn, "c", "Unpopular", user_a, 0).await?;
 
         // Let's set up a team that owns both b and c, but not a.
         let not_the_a_team = faker::team(&mut conn, "org", "team").await?;
-        add_team_to_crate(&not_the_a_team, &top_b, &user_b, &mut conn).await?;
-        add_team_to_crate(&not_the_a_team, &not_top_c, &user_b, &mut conn).await?;
+        add_team_to_crate(&not_the_a_team, &top_b, user_b, &mut conn).await?;
+        add_team_to_crate(&not_the_a_team, &not_top_c, user_b, &mut conn).await?;
 
         let top_crates = TopCrates::new(&mut conn, 2).await?;
 
@@ -209,7 +215,7 @@ mod tests {
         assert!(!pkg_a.shared_authors(pkg_b.authors()));
 
         // Now let's go get package c and pretend it's a new package.
-        let pkg_c = Crate::from_name(&mut conn, "c").await?;
+        let pkg_c = Crate::from_name(&mut conn, "c").await?.unwrap();
 
         // c _does_ have an author in common with a.
         assert!(pkg_a.shared_authors(pkg_c.authors()));

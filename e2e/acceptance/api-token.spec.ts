@@ -3,13 +3,21 @@ import { http, HttpResponse } from 'msw';
 
 test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
   test.beforeEach(async ({ msw }) => {
-    let user = msw.db.user.create({
+    let user = await msw.db.user.create({
       login: 'johnnydee',
       name: 'John Doe',
       email: 'john@doe.com',
       avatar: 'https://avatars2.githubusercontent.com/u/1234567?v=4',
     });
-    msw.db.apiToken.create({
+
+    await msw.db.apiToken.create({
+      user,
+      name: 'foo',
+      createdAt: '2017-08-01T12:34:56',
+      lastUsedAt: '2017-11-02T01:45:14',
+    });
+
+    await msw.db.apiToken.create({
       user,
       name: 'BAR',
       createdAt: '2017-11-19T17:59:22',
@@ -17,18 +25,12 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
       expiredAt: '2017-12-19T17:59:22',
     });
 
-    msw.db.apiToken.create({
+    await msw.db.apiToken.create({
       user,
       name: 'recently expired',
       createdAt: '2017-08-01T12:34:56',
       lastUsedAt: '2017-11-02T01:45:14',
       expiredAt: '2017-11-19T17:59:22',
-    });
-    msw.db.apiToken.create({
-      user,
-      name: 'foo',
-      createdAt: '2017-08-01T12:34:56',
-      lastUsedAt: '2017-11-02T01:45:14',
     });
 
     await msw.authenticateAs(user);
@@ -46,7 +48,7 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await expect(row1.locator('[data-test-expired-at]')).toHaveText('Expires in 29 days');
     await expect(row1.locator('[data-test-save-token-button]')).toHaveCount(0);
     await expect(row1.locator('[data-test-revoke-token-button]')).toBeVisible();
-    await expect(row1.locator('[data-test-saving-spinner]')).toHaveCount(0);
+    await expect(row1.locator('[data-test-spinner]')).toHaveCount(0);
     await expect(row1.locator('[data-test-error]')).toHaveCount(0);
     await expect(row1.locator('[data-test-token]')).toHaveCount(0);
 
@@ -56,7 +58,7 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await expect(row2.locator('[data-test-expired-at]')).toHaveCount(0);
     await expect(row2.locator('[data-test-save-token-button]')).toHaveCount(0);
     await expect(row2.locator('[data-test-revoke-token-button]')).toBeVisible();
-    await expect(row2.locator('[data-test-saving-spinner]')).toHaveCount(0);
+    await expect(row2.locator('[data-test-spinner]')).toHaveCount(0);
     await expect(row2.locator('[data-test-error]')).toHaveCount(0);
     await expect(row2.locator('[data-test-token]')).toHaveCount(0);
 
@@ -66,7 +68,7 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await expect(row3.locator('[data-test-expired-at]')).toHaveText('Expired about 18 hours ago');
     await expect(row3.locator('[data-test-save-token-button]')).toHaveCount(0);
     await expect(row3.locator('[data-test-revoke-token-button]')).toHaveCount(0);
-    await expect(row3.locator('[data-test-saving-spinner]')).toHaveCount(0);
+    await expect(row3.locator('[data-test-spinner]')).toHaveCount(0);
     await expect(row3.locator('[data-test-error]')).toHaveCount(0);
     await expect(row3.locator('[data-test-token]')).toHaveCount(0);
   });
@@ -77,7 +79,7 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await expect(page.locator('[data-test-api-token]')).toHaveCount(3);
 
     await page.click('[data-test-api-token="1"] [data-test-revoke-token-button]');
-    expect(msw.db.apiToken.findMany({}).length, 'API token has been deleted from the backend database').toBe(2);
+    await expect.poll(() => msw.db.apiToken.findMany().length).toBe(2);
 
     await expect(page.locator('[data-test-api-token]')).toHaveCount(2);
     await expect(page.locator('[data-test-api-token="2"]')).toBeVisible();
@@ -89,12 +91,21 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await expect(page).toHaveURL('/settings/tokens');
     await expect(page.locator('[data-test-api-token]')).toHaveCount(3);
 
+    await expect(page.locator('[data-test-api-token="1"] [data-test-regenerate-token-button]')).toBeVisible();
+    await expect(page.locator('[data-test-api-token="1"] [data-test-revoke-token-button]')).toBeVisible();
+
+    await expect(page.locator('[data-test-api-token="2"] [data-test-regenerate-token-button]')).toBeVisible();
+    await expect(page.locator('[data-test-api-token="2"] [data-test-revoke-token-button]')).toBeVisible();
+
+    await expect(page.locator('[data-test-api-token="3"] [data-test-regenerate-token-button]')).toBeVisible();
+    await expect(page.locator('[data-test-api-token="3"] [data-test-revoke-token-button]')).not.toBeVisible();
+
     await page.click('[data-test-api-token="1"] [data-test-regenerate-token-button]');
     await expect(page).toHaveURL('/settings/tokens/new?from=1');
   });
 
   test('failed API tokens revocation shows an error', async ({ page, msw }) => {
-    await msw.worker.use(http.delete('/api/v1/me/tokens/:id', () => HttpResponse.json({}, { status: 500 })));
+    msw.worker.use(http.delete('/api/v1/me/tokens/:id', () => HttpResponse.json({}, { status: 500 })));
 
     await page.goto('/settings/tokens');
     await expect(page).toHaveURL('/settings/tokens');
@@ -120,28 +131,35 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await page.fill('[data-test-name]', 'the new token');
     await page.click('[data-test-scope="publish-update"]');
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
 
     await page.click('[data-test-generate]');
 
-    let token = msw.db.apiToken.findFirst({ where: { name: { equals: 'the new token' } } })?.token;
-    expect(token, 'API token has been created in the backend database').toBeTruthy();
+    await expect.poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'the new token' }))).toBeTruthy();
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'the new token' }))?.token;
 
     await expect(page.locator('[data-test-api-token="4"] [data-test-name]')).toHaveText('the new token');
     await expect(page.locator('[data-test-api-token="4"] [data-test-save-token-button]')).toHaveCount(0);
     await expect(page.locator('[data-test-api-token="4"] [data-test-revoke-token-button]')).toBeVisible();
-    await expect(page.locator('[data-test-api-token="4"] [data-test-saving-spinner]')).toHaveCount(0);
+    await expect(page.locator('[data-test-api-token="4"] [data-test-spinner]')).toHaveCount(0);
     await expect(page.locator('[data-test-api-token="4"] [data-test-error]')).toHaveCount(0);
     await expect(page.locator('[data-test-token]')).toHaveText(token);
   });
 
   test('API tokens are only visible in plaintext until the page is left', async ({ page, msw }) => {
     await page.goto('/settings/tokens');
+
     await page.click('[data-test-new-token-button]');
+    await expect(page).toHaveURL('/settings/tokens/new');
+
     await page.fill('[data-test-name]', 'the new token');
     await page.click('[data-test-scope="publish-update"]');
     await page.click('[data-test-generate]');
 
-    let token = msw.db.apiToken.findFirst({ where: { name: { equals: 'the new token' } } })?.token;
+    await expect.poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'the new token' }))).toBeTruthy();
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'the new token' }))?.token;
     await expect(page.locator('[data-test-token]')).toHaveText(token);
 
     // leave the API tokens page
@@ -162,6 +180,7 @@ test.describe('Acceptance | api-tokens', { tag: '@acceptance' }, () => {
     await expect(page.locator('[data-test-api-token]')).toHaveCount(3);
 
     await page.click('[data-test-new-token-button]');
+    await expect(page).toHaveURL('/settings/tokens/new');
 
     // favor navigation via link click over page.goto
     await page.getByRole('link', { name: 'Profile' }).click();

@@ -1,22 +1,22 @@
 use diesel::prelude::*;
 
-use crate::models::{Crate, NewTeam, NewUser, Team, User};
-use crate::tests::util::github::next_gh_id;
+use crate::models::{Crate, NewTeam, Team};
+use crates_io_test_utils::github::next_gh_id;
 
 pub mod faker {
     use super::*;
-    use crate::tests::builders::CrateBuilder;
     use anyhow::anyhow;
+    use crates_io_test_utils::builders::{CrateBuilder, UserBuilder};
     use diesel_async::AsyncPgConnection;
 
     pub async fn crate_and_version(
         conn: &mut AsyncPgConnection,
         name: &str,
         description: &str,
-        user: &User,
+        user_id: i32,
         downloads: i32,
     ) -> anyhow::Result<Crate> {
-        CrateBuilder::new(name, user.id)
+        CrateBuilder::new(name, user_id)
             .description(description)
             .downloads(downloads)
             .version("1.0.0")
@@ -37,12 +37,10 @@ pub mod faker {
         Ok(team.create_or_update(conn).await?)
     }
 
-    pub async fn user(conn: &mut AsyncPgConnection, login: &str) -> QueryResult<User> {
-        NewUser::builder()
-            .gh_id(next_gh_id())
-            .gh_login(login)
-            .gh_access_token("token")
-            .build()
+    pub async fn user(conn: &mut AsyncPgConnection, login: &str) -> QueryResult<i32> {
+        UserBuilder::new()
+            .with_username(login)
+            .new_user()
             .insert(conn)
             .await
     }

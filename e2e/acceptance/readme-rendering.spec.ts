@@ -2,6 +2,39 @@ import { expect, test } from '@/e2e/helper';
 import { http, HttpResponse } from 'msw';
 
 const README_HTML = `
+<div class="markdown-alert markdown-alert-note">
+<p class="markdown-alert-title">Note</p>
+<p>Useful information that users should know, even when skimming content.</p>
+</div>
+<div class="markdown-alert markdown-alert-tip">
+<p class="markdown-alert-title">Tip</p>
+<p>Helpful advice for doing things better or more easily.</p>
+</div>
+<div class="markdown-alert markdown-alert-important">
+<p class="markdown-alert-title">Important</p>
+<p>Key information users need to know to achieve their goal.</p>
+</div>
+<div class="markdown-alert markdown-alert-warning">
+<p class="markdown-alert-title">Warning</p>
+<p>Urgent info that needs immediate user attention to avoid problems.</p>
+</div>
+<div class="markdown-alert markdown-alert-caution">
+<p class="markdown-alert-title">Caution</p>
+<p>Advises about risks or negative outcomes of certain actions.</p>
+</div>
+
+<div class="markdown-alert markdown-alert-note">
+<p class="markdown-alert-title">Note</p>
+<div class="markdown-alert markdown-alert-important">
+<p class="markdown-alert-title">Important</p>
+<div class="markdown-alert markdown-alert-caution">
+<p class="markdown-alert-title">Caution</p>
+<p>Rick roll</p>
+<p>Never gonna give you up</p>
+</div>
+</div>
+</div>
+
 <p><strong>Serde is a framework for <em>ser</em>ializing and <em>de</em>serializing Rust data structures efficiently and generically.</strong></p>
 <hr>
 <p>You may be looking for:</p>
@@ -62,12 +95,12 @@ graph TD;
 <ul>
   <li>
     <p>Delegate to a method with a different name</p>
-    <pre><code class="language-rust hljs" data-highlighted="yes"><span class="hljs-keyword">struct</span> <span class="hljs-title class_">Stack</span> { inner: <span class="hljs-type">Vec</span>&lt;<span class="hljs-type">u32</span>&gt; }
-<span class="hljs-keyword">impl</span> <span class="hljs-title class_">Stack</span> {
+    <pre><code class="language-rust">struct Stack { inner: Vec&lt;u32&gt; }
+impl Stack {
     delegate! {
-        to <span class="hljs-keyword">self</span>.inner {
-            <span class="hljs-meta">#[call(push)]</span>
-            <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">add</span>(&amp;<span class="hljs-keyword">mut</span> <span class="hljs-keyword">self</span>, value: <span class="hljs-type">u32</span>);
+        to self.inner {
+            #[call(push)]
+            pub fn add(&amp;mut self, value: u32);
         }
     }
 }
@@ -82,38 +115,46 @@ graph TD;
 </li>
 </ol>
 </section>
+
+<h3 align="center">
+  <a>
+    <img width="1000" height="200" alt="Banner with Logo" src="https://static.rerun.io/d0f5443d4803cac65c73fcc064936c09f5e7f208_rerun_banner.png" />
+  </a>
+</h3>
 `;
 
 test.describe('Acceptance | README rendering', { tag: '@acceptance' }, () => {
   test('it works', async ({ page, msw, percy }) => {
-    let crate = msw.db.crate.create({ name: 'serde' });
-    msw.db.version.create({ crate, num: '1.0.0', readme: README_HTML });
+    let crate = await msw.db.crate.create({ name: 'serde' });
+    await msw.db.version.create({ crate, num: '1.0.0', readme: README_HTML });
 
     await page.goto('/crates/serde');
-    const readme = page.locator('[data-test-readme]');
+    let readme = page.locator('[data-test-readme]');
     await expect(readme).toBeVisible();
     await expect(readme.locator('ul > li')).toHaveCount(7);
-    await expect(readme.locator('pre > code.language-rust.hljs')).toHaveCount(2);
-    await expect(readme.locator('pre > code.language-mermaid svg')).toBeVisible();
-    await expect(readme.locator('pre > code.language-mermaid')).toHaveAttribute('data-processed', 'true');
+    await expect(readme.locator('pre > code.language-rust:has(span.line)')).toHaveCount(2);
+    await expect(readme.locator('pre > code.language-mermaid svg.flowchart')).toBeVisible();
 
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
   });
 
   test('it shows a fallback if no readme is available', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({ name: 'serde' });
-    msw.db.version.create({ crate, num: '1.0.0' });
+    let crate = await msw.db.crate.create({ name: 'serde' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
 
     await page.goto('/crates/serde');
     await expect(page.locator('[data-test-no-readme]')).toBeVisible();
   });
 
   test('it shows an error message and retry button if loading fails', async ({ page, msw }) => {
-    let crate = msw.db.crate.create({ name: 'serde' });
-    msw.db.version.create({ crate, num: '1.0.0', readme: 'foo' });
+    let crate = await msw.db.crate.create({ name: 'serde' });
+    await msw.db.version.create({ crate, num: '1.0.0', readme: 'foo' });
 
     // Simulate a server error when fetching the README
-    msw.worker.use(http.get('/api/v1/crates/:name/:version/readme', () => HttpResponse.html('', { status: 500 })));
+    msw.worker.use(
+      http.get('https://static.crates.io/readmes/serde/serde-1.0.0.html', () => HttpResponse.html('', { status: 500 })),
+    );
 
     await page.goto('/crates/serde');
     await expect(page.locator('[data-test-readme-error]')).toBeVisible();

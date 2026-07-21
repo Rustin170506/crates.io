@@ -1,6 +1,5 @@
-import { Page } from '@playwright/test';
 import { AxeBuilder } from '@axe-core/playwright';
-import { expect } from '@playwright/test';
+import { expect, Page } from '@playwright/test';
 
 // Ref: https://playwright.dev/docs/accessibility-testing#scanning-an-entire-page
 export class A11yPage {
@@ -17,7 +16,7 @@ export class A11yPage {
   }
 
   async audit() {
-    const result = await this.builder.analyze();
+    let result = await this.builder.analyze();
     this._check(result);
   }
 
@@ -26,7 +25,7 @@ export class A11yPage {
     if (options) {
       builder = builder.options(options);
     }
-    const result = await builder.analyze();
+    let result = await builder.analyze();
     this._check(result);
   }
 

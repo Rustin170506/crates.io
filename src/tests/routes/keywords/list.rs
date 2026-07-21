@@ -1,6 +1,7 @@
-use crate::models::Keyword;
-use crate::tests::util::{RequestHelper, TestApp};
-use crate::views::EncodableKeyword;
+use crate::util::{RequestHelper, TestApp};
+use crates_io::models::Keyword;
+use crates_io::views::EncodableKeyword;
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct KeywordList {
@@ -17,15 +18,13 @@ struct KeywordMeta {
 async fn index() {
     let url = "/api/v1/keywords";
     let (app, anon) = TestApp::init().empty().await;
-    let mut conn = app.db_conn().await;
+    let conn = app.db_conn().await;
 
     let json: KeywordList = anon.get(url).await.good();
     assert_eq!(json.keywords.len(), 0);
     assert_eq!(json.meta.total, 0);
 
-    Keyword::find_or_create_all(&mut conn, &["foo"])
-        .await
-        .unwrap();
+    Keyword::find_or_create_all(&conn, &["foo"]).await.unwrap();
 
     let json: KeywordList = anon.get(url).await.good();
     assert_eq!(json.keywords.len(), 1);

@@ -1,13 +1,12 @@
-use crate::tests::{TestApp, util::RequestHelper};
+use crate::{TestApp, util::RequestHelper};
 use chrono::{DateTime, Duration, Utc};
-use http::StatusCode;
 use insta::assert_snapshot;
 
 const URL: &str = "/api/v1/me";
 const LOCK_REASON: &str = "test lock reason";
 
 async fn lock_account(app: &TestApp, user_id: i32, until: Option<DateTime<Utc>>) {
-    use crate::schema::users;
+    use crates_io::schema::users;
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
@@ -30,7 +29,7 @@ async fn account_locked_indefinitely() {
     lock_account(&app, user.as_model().id, None).await;
 
     let response = user.get::<()>(URL).await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_snapshot!(response.status(), @"403 Forbidden");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"This account is indefinitely locked. Reason: test lock reason"}]}"#);
 }
 
@@ -42,7 +41,7 @@ async fn account_locked_with_future_expiry() {
     lock_account(&app, user.as_model().id, Some(until)).await;
 
     let response = user.get::<()>(URL).await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_snapshot!(response.status(), @"403 Forbidden");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"This account is locked until 2099-12-12 at 12:12:12 UTC. Reason: test lock reason"}]}"#);
 }
 

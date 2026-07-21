@@ -2,17 +2,17 @@ import { expect, test } from '@/e2e/helper';
 
 test.describe('Acceptance | Settings', { tag: '@acceptance' }, () => {
   test.beforeEach(async ({ msw }) => {
-    let user1 = msw.db.user.create({ name: 'blabaere' });
-    let user2 = msw.db.user.create({ name: 'thehydroimpulse' });
-    let team1 = msw.db.team.create({ org: 'org', name: 'blabaere' });
-    let team2 = msw.db.team.create({ org: 'org', name: 'thehydroimpulse' });
+    let user1 = await msw.db.user.create({ name: 'blabaere' });
+    let user2 = await msw.db.user.create({ name: 'thehydroimpulse' });
+    let team1 = await msw.db.team.create({ org: 'org', name: 'blabaere' });
+    let team2 = await msw.db.team.create({ org: 'org', name: 'thehydroimpulse' });
 
-    let crate = msw.db.crate.create({ name: 'nanomsg' });
-    msw.db.version.create({ crate, num: '1.0.0' });
-    msw.db.crateOwnership.create({ crate, user: user1 });
-    msw.db.crateOwnership.create({ crate, user: user2 });
-    msw.db.crateOwnership.create({ crate, team: team1 });
-    msw.db.crateOwnership.create({ crate, team: team2 });
+    let crate = await msw.db.crate.create({ name: 'nanomsg' });
+    await msw.db.version.create({ crate, num: '1.0.0' });
+    await msw.db.crateOwnership.create({ crate, user: user1 });
+    await msw.db.crateOwnership.create({ crate, user: user2 });
+    await msw.db.crateOwnership.create({ crate, team: team1 });
+    await msw.db.crateOwnership.create({ crate, team: team2 });
 
     await msw.authenticateAs(user1);
   });
@@ -23,12 +23,13 @@ test.describe('Acceptance | Settings', { tag: '@acceptance' }, () => {
 
     await expect(page.locator('[data-test-owners] [data-test-owner-team]')).toHaveCount(2);
     await expect(page.locator('[data-test-owners] [data-test-owner-user]')).toHaveCount(2);
-    await expect(page.locator('a[href="/teams/github:org:thehydroimpulse"]').first()).toBeVisible();
-    await expect(page.locator('a[href="/teams/github:org:blabaere"]').first()).toBeVisible();
-    await expect(page.locator('a[href="/users/thehydroimpulse"]').first()).toBeVisible();
-    await expect(page.locator('a[href="/users/blabaere"]').first()).toBeVisible();
+    await expect(page.locator('[data-test-owners] a[href="/teams/github:org:thehydroimpulse"]').first()).toBeVisible();
+    await expect(page.locator('[data-test-owners] a[href="/teams/github:org:blabaere"]').first()).toBeVisible();
+    await expect(page.locator('[data-test-owners] a[href="/users/thehydroimpulse"]').first()).toBeVisible();
+    await expect(page.locator('[data-test-owners] a[href="/users/blabaere"]').first()).toBeVisible();
 
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
     await a11y.audit();
   });
 

@@ -6,6 +6,7 @@ use crates_io::{App, Emails, metrics::LogEncoder};
 use std::{sync::Arc, time::Duration};
 
 use axum::ServiceExt;
+use crates_io_env_vars::list;
 use crates_io_github::RealGitHubClient;
 use prometheus::Encoder;
 use reqwest::Client;
@@ -29,11 +30,24 @@ fn main() -> anyhow::Result<()> {
 
     let emails = Emails::from_environment(&config);
 
-    let client = Client::new();
-    let github = RealGitHubClient::new(client);
-    let github = Box::new(github);
+    let user_agent = crates_io_version::user_agent();
+    let client = Client::builder().user_agent(user_agent).build()?;
 
-    let app = Arc::new(App::new(config, emails, github));
+    let github = RealGitHubClient::new(client);
+    let github = Arc::new(github);
+
+    let app = App::builder()
+        .databases_from_config(&config.db)
+        .github(github)
+        .github_oauth_from_config(&config)
+        .trustpub_providers(&list("TRUSTPUB_PROVIDERS")?)
+        .emails(emails)
+        .storage_from_config(&config.storage)
+        .rate_limiter_from_config(config.rate_limits.actions.clone())
+        .config(Arc::new(config))
+        .build();
+
+    let app = Arc::new(app);
 
     // Start the background thread periodically logging instance metrics.
     log_instance_metrics_thread(app.clone());
@@ -60,7 +74,7 @@ fn main() -> anyhow::Result<()> {
     // Block the main thread until the server has shutdown
     rt.block_on(async {
         // Create a `TcpListener` using tokio.
-        let listener = TcpListener::bind((app.config.ip, app.config.port)).await?;
+        let listener = TcpListener::bind((app.config.bind.ip, app.config.bind.port)).await?;
 
         let addr = listener.local_addr()?;
 
@@ -101,7 +115,7 @@ async fn shutdown_signal() {
 
 fn log_instance_metrics_thread(app: Arc<App>) {
     // Only run the thread if the configuration is provided
-    let interval = match app.config.instance_metrics_log_every_seconds {
+    let interval = match app.config.metrics.instance_log_every_seconds {
         Some(secs) => Duration::from_secs(secs),
         None => return,
     };
@@ -109,7 +123,7 @@ fn log_instance_metrics_thread(app: Arc<App>) {
     std::thread::spawn(move || {
         loop {
             if let Err(err) = log_instance_metrics_inner(&app) {
-                error!(?err, "log_instance_metrics error");
+                error!("log_instance_metrics error: {err}");
             }
             std::thread::sleep(interval);
         }

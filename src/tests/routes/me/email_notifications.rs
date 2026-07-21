@@ -1,10 +1,11 @@
-use crate::schema::crate_owners;
-use crate::tests::builders::CrateBuilder;
-use crate::tests::new_user;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::CrateBuilder;
+use crate::new_user;
+use crate::util::{RequestHelper, TestApp};
+use crates_io::schema::crate_owners;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use http::StatusCode;
+use serde::Serialize;
 use serde_json::json;
 
 #[derive(Serialize)]
@@ -13,7 +14,7 @@ struct EmailNotificationsUpdate {
     email_notifications: bool,
 }
 
-impl crate::tests::util::MockCookieUser {
+impl crate::util::MockCookieUser {
     async fn update_email_notifications(&self, updates: Vec<EmailNotificationsUpdate>) {
         let response = self
             .put::<()>("/api/v1/me/email_notifications", json!(updates).to_string())
@@ -115,11 +116,7 @@ async fn test_update_email_notifications_not_owned() {
     let (app, _, user) = TestApp::init().with_user().await;
     let mut conn = app.db_conn().await;
 
-    let user_id = new_user("arbitrary_username")
-        .insert(&mut conn)
-        .await
-        .unwrap()
-        .id;
+    let user_id = new_user("arbitrary_username").insert(&conn).await.unwrap();
 
     let not_my_crate = CrateBuilder::new("test_package", user_id)
         .expect_build(&mut conn)

@@ -8,12 +8,15 @@ use crate::models::{Crate, CrateOwnerInvitation, User};
 use crate::schema::{crate_owner_invitations, crates, users};
 use crate::util::RequestUtils;
 use crate::util::errors::{AppResult, BoxedAppError, bad_request, custom, forbidden, internal};
+use crate::util::no_store;
 use crate::views::{
     EncodableCrateOwnerInvitation, EncodableCrateOwnerInvitationV1, EncodablePublicUser,
     InvitationResponse,
 };
 use axum::Json;
 use axum::extract::{FromRequestParts, Path, Query};
+use axum_extra::TypedHeader;
+use axum_extra::headers::CacheControl;
 use chrono::Utc;
 use diesel::pg::Pg;
 use diesel::prelude::*;
@@ -22,6 +25,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use http::StatusCode;
 use http::request::Parts;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -39,12 +43,13 @@ pub struct LegacyListResponse {
     path = "/api/v1/me/crate_owner_invitations",
     security(("cookie" = [])),
     tag = "owners",
+    extensions(("x-internal" = json!(true))),
     responses((status = 200, description = "Successful Response", body = inline(LegacyListResponse))),
 )]
 pub async fn list_crate_owner_invitations_for_user(
     app: AppState,
     req: Parts,
-) -> AppResult<Json<LegacyListResponse>> {
+) -> AppResult<(TypedHeader<CacheControl>, Json<LegacyListResponse>)> {
     let mut conn = app.db_read().await?;
     let auth = AuthCheck::only_cookie().check(&req, &mut conn).await?;
 
@@ -52,7 +57,7 @@ pub async fn list_crate_owner_invitations_for_user(
 
     let PrivateListResponse {
         invitations, users, ..
-    } = prepare_list(&app, &req, auth, ListFilter::InviteeId(user_id), &mut conn).await?;
+    } = prepare_list(&app, &req, auth, ListFilter::InviteeId(user_id), &conn).await?;
 
     // The schema for the private endpoints is converted to the schema used by v1 endpoints.
     let crate_owner_invitations = invitations
@@ -75,10 +80,13 @@ pub async fn list_crate_owner_invitations_for_user(
         })
         .collect::<AppResult<Vec<EncodableCrateOwnerInvitationV1>>>()?;
 
-    Ok(Json(LegacyListResponse {
-        crate_owner_invitations,
-        users,
-    }))
+    Ok((
+        no_store(),
+        Json(LegacyListResponse {
+            crate_owner_invitations,
+            users,
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize, FromRequestParts, utoipa::IntoParams)]
@@ -103,19 +111,20 @@ pub struct ListQueryParams {
     params(ListQueryParams, PaginationQueryParams),
     security(("cookie" = [])),
     tag = "owners",
+    extensions(("x-internal" = json!(true))),
     responses((status = 200, description = "Successful Response", body = inline(PrivateListResponse))),
 )]
 pub async fn list_crate_owner_invitations(
     app: AppState,
     params: ListQueryParams,
     req: Parts,
-) -> AppResult<Json<PrivateListResponse>> {
+) -> AppResult<(TypedHeader<CacheControl>, Json<PrivateListResponse>)> {
     let mut conn = app.db_read().await?;
     let auth = AuthCheck::only_cookie().check(&req, &mut conn).await?;
 
     let filter = params.try_into()?;
-    let list = prepare_list(&app, &req, auth, filter, &mut conn).await?;
-    Ok(Json(list))
+    let list = prepare_list(&app, &req, auth, filter, &conn).await?;
+    Ok((no_store(), Json(list)))
 }
 
 enum ListFilter {
@@ -144,7 +153,7 @@ async fn prepare_list(
     req: &Parts,
     auth: Authentication,
     filter: ListFilter,
-    conn: &mut AsyncPgConnection,
+    mut conn: &AsyncPgConnection,
 ) -> AppResult<PrivateListResponse> {
     let pagination: PaginationOptions = PaginationOptions::builder()
         .enable_pages(false)
@@ -163,9 +172,10 @@ async fn prepare_list(
         match filter {
             ListFilter::CrateName(crate_name) => {
                 // Only allow crate owners to query pending invitations for their crate.
-                let krate: Crate = Crate::by_name(&crate_name).first(conn).await?;
+                let krate: Crate = Crate::by_name(&crate_name).first(&mut conn).await?;
                 let owners = krate.owners(conn).await?;
-                if Rights::get(user, &*state.github, &owners).await? != Rights::Full {
+                let encryption = &state.config.token_encryption;
+                if Rights::get(user, &*state.github, &owners, encryption).await? != Rights::Full {
                     let detail = "only crate owners can query pending invitations for their crate";
                     return Err(forbidden(detail));
                 }
@@ -186,7 +196,7 @@ async fn prepare_list(
 
     // Load all the non-expired invitations matching the filter.
     let expire_cutoff = config.ownership_invitations_expiration;
-    let query = crate_owner_invitations::table
+    let query = CrateOwnerInvitation::query()
         .filter(sql_filter)
         .filter(crate_owner_invitations::created_at.gt((Utc::now() - expire_cutoff).naive_utc()))
         .order_by((
@@ -198,7 +208,7 @@ async fn prepare_list(
 
     // Load and paginate the results.
     let mut raw_invitations: Vec<CrateOwnerInvitation> = match pagination.page {
-        Page::Unspecified => query.load(conn).await?,
+        Page::Unspecified => query.load(&mut conn).await?,
         Page::Seek(s) => {
             let seek_key: (i32, i32) = s.decode()?;
             query
@@ -209,7 +219,7 @@ async fn prepare_list(
                             .and(crate_owner_invitations::invited_user_id.gt(seek_key.1)),
                     ),
                 )
-                .load(conn)
+                .load(&mut conn)
                 .await?
         }
         Page::Numeric(_) => unreachable!("page-based pagination is disabled"),
@@ -246,7 +256,7 @@ async fn prepare_list(
         let new_names: Vec<(i32, String)> = crates::table
             .select((crates::id, crates::name))
             .filter(crates::id.eq_any(missing_crate_names))
-            .load(conn)
+            .load(&mut conn)
             .await?;
         for (id, name) in new_names.into_iter() {
             crate_names.insert(id, name);
@@ -263,9 +273,9 @@ async fn prepare_list(
         .filter(|id| !users.contains_key(id))
         .collect::<Vec<_>>();
     if !missing_users.is_empty() {
-        let new_users: Vec<User> = users::table
+        let new_users: Vec<User> = User::query()
             .filter(users::id.eq_any(missing_users))
-            .load(conn)
+            .load(&mut conn)
             .await?;
         for user in new_users.into_iter() {
             users.insert(user.id, user);
@@ -322,8 +332,9 @@ struct ResponseMeta {
     next_page: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct OwnerInvitation {
+    #[schema(inline)]
     crate_owner_invite: InvitationResponse,
 }
 
@@ -340,6 +351,7 @@ pub struct HandleResponse {
     params(
         ("crate_id" = i32, Path, description = "ID of the crate"),
     ),
+    request_body = inline(OwnerInvitation),
     security(
         ("api_token" = []),
         ("cookie" = []),
@@ -360,12 +372,12 @@ pub async fn handle_crate_owner_invitation(
         .await?
         .user_id();
     let invitation =
-        CrateOwnerInvitation::find_by_id(user_id, crate_invite.crate_id, &mut conn).await?;
+        CrateOwnerInvitation::find_by_id(user_id, crate_invite.crate_id, &conn).await?;
 
     if crate_invite.accepted {
         invitation.accept(&mut conn).await?;
     } else {
-        invitation.decline(&mut conn).await?;
+        invitation.decline(&conn).await?;
     }
 
     Ok(Json(HandleResponse {
@@ -388,7 +400,7 @@ pub async fn accept_crate_owner_invitation_with_token(
     Path(token): Path<String>,
 ) -> AppResult<Json<HandleResponse>> {
     let mut conn = state.db_write().await?;
-    let invitation = CrateOwnerInvitation::find_by_token(&token, &mut conn).await?;
+    let invitation = CrateOwnerInvitation::find_by_token(&token, &conn).await?;
 
     let crate_id = invitation.crate_id;
     invitation.accept(&mut conn).await?;
@@ -414,6 +426,14 @@ impl From<AcceptError> for BoxedAppError {
                 );
 
                 custom(StatusCode::GONE, detail)
+            }
+            AcceptError::EmailNotVerified { crate_name } => {
+                let detail = format!(
+                    "You need to verify your email address before you can accept the invitation \
+                    to become an owner of the {crate_name} crate.",
+                );
+
+                custom(StatusCode::FORBIDDEN, detail)
             }
         }
     }

@@ -1,0 +1,37 @@
+---
+source: src/tests/routes/me/tokens/create.rs
+expression: app.emails_snapshot().await
+---
+To: foo@example.com
+From: crates.io <noreply@crates.io>
+Subject: crates.io: New API token "bar" created
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="[boundary]"
+
+--[boundary]
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+
+Hello foo!
+
+A new API token with the name "bar" was recently added to your crates.io account.
+
+If you did not create this token, you should revoke it immediately: https://crates.io/settings/tokens.
+
+--
+The crates.io Team
+--[boundary]
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+
+<p>Hello foo!</p>
+
+<p>A new API token with the name "<strong>bar</strong>" was recently added to your crates.io account.</p>
+
+<p>If you did not create this token, you should revoke it immediately: <a href="https://crates.io/settings/tokens">https://crates.io/settings/tokens</a>.</p>
+
+<p>--<br>The crates.io Team</p>
+--[boundary]--

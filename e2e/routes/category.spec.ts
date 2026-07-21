@@ -23,15 +23,15 @@ test.describe('Route | category', { tag: '@routes' }, () => {
   });
 
   test('updates the search field when the categories route is accessed', async ({ page, msw }) => {
-    msw.db.category.create({ category: 'foo' });
+    await msw.db.category.create({ category: 'foo' });
 
-    const searchInput = page.locator('[data-test-search-input]');
+    let searchInput = page.locator('[data-test-search-input]');
     await page.goto('/');
     await page.waitForURL('/');
     await expect(searchInput).toHaveValue('');
 
     // favor navigation via link click over page.goto
-    await page.getByRole('link', { name: 'foo 0 crates' }).click();
+    await page.getByRole('link', { name: 'foo', exact: true }).click();
     await page.waitForURL('/categories/foo');
     await expect(searchInput).toHaveValue('category:foo ');
 

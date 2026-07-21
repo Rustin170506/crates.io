@@ -1,7 +1,7 @@
-use super::update::UserConfirmEmail;
 use crate::app::AppState;
 use crate::auth::AuthCheck;
 use crate::controllers::helpers::OkResponse;
+use crate::email::EmailMessage;
 use crate::models::Email;
 use crate::util::errors::AppResult;
 use crate::util::errors::{BoxedAppError, bad_request};
@@ -9,9 +9,10 @@ use axum::extract::Path;
 use crates_io_database::schema::emails;
 use diesel::dsl::sql;
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use http::request::Parts;
+use minijinja::context;
+use secrecy::ExposeSecret;
 
 /// Marks the email belonging to the given token as verified.
 #[utoipa::path(
@@ -68,74 +69,32 @@ pub async fn resend_email_verification(
         return Err(bad_request("current user does not match requested user"));
     }
 
-    conn.transaction(|conn| {
-        async move {
-            let email: Email = diesel::update(Email::belonging_to(auth.user()))
-                .set(emails::token.eq(sql("DEFAULT")))
-                .get_result(conn)
-                .await
-                .optional()?
-                .ok_or_else(|| bad_request("Email could not be found"))?;
+    conn.transaction(async |conn| {
+        let email: Email = diesel::update(Email::belonging_to(auth.user()))
+            .set(emails::token.eq(sql("DEFAULT")))
+            .returning(Email::as_returning())
+            .get_result(conn)
+            .await
+            .optional()?
+            .ok_or_else(|| bad_request("Email could not be found"))?;
 
-            let email1 = UserConfirmEmail {
-                user_name: &auth.user().gh_login,
-                domain: &state.emails.domain,
-                token: email.token,
-            };
+        let email_message = EmailMessage::from_template(
+            "user_confirm",
+            context! {
+                user_name => auth.user().gh_login,
+                domain => state.emails.domain,
+                token => email.token.expose_secret()
+            },
+        )
+        .map_err(|_| bad_request("Failed to render email template"))?;
 
-            state
-                .emails
-                .send(&email.email, email1)
-                .await
-                .map_err(BoxedAppError::from)
-        }
-        .scope_boxed()
+        state
+            .emails
+            .send(&email.email, email_message)
+            .await
+            .map_err(BoxedAppError::from)
     })
     .await?;
 
     Ok(OkResponse::new())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::tests::util::{RequestHelper, TestApp};
-    use http::StatusCode;
-    use insta::assert_snapshot;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_no_auth() {
-        let (app, anon, user) = TestApp::init().with_user().await;
-
-        let url = format!("/api/v1/users/{}/resend", user.as_model().id);
-        let response = anon.put::<()>(&url, "").await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"this action requires authentication"}]}"#);
-
-        assert_eq!(app.emails().await.len(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_wrong_user() {
-        let (app, _anon, user) = TestApp::init().with_user().await;
-        let user2 = app.db_new_user("bar").await;
-
-        let url = format!("/api/v1/users/{}/resend", user2.as_model().id);
-        let response = user.put::<()>(&url, "").await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"current user does not match requested user"}]}"#);
-
-        assert_eq!(app.emails().await.len(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_happy_path() {
-        let (app, _anon, user) = TestApp::init().with_user().await;
-
-        let url = format!("/api/v1/users/{}/resend", user.as_model().id);
-        let response = user.put::<()>(&url, "").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_snapshot!(response.text(), @r#"{"ok":true}"#);
-
-        assert_snapshot!(app.emails_snapshot().await);
-    }
 }

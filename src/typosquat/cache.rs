@@ -1,6 +1,7 @@
 use diesel_async::AsyncPgConnection;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::{instrument, warn};
 use typomania::Harness;
 use typomania::checks::{Bitflips, Omitted, SwappedWords, Typos};
 
@@ -22,8 +23,8 @@ impl Cache {
     /// Instantiates a new [`Cache`] from the environment.
     ///
     /// This reads the `NOTIFICATION_EMAILS_ENV` environment variable to get the list of e-mail
-    /// addresses to send notifications to, then invokes [`Cache::new`] to read popular crates from
-    /// the database.
+    /// addresses to send notifications to. If any addresses are configured, it invokes
+    /// [`Cache::new`] to read popular crates from the database. Otherwise, it builds an empty cache.
     #[instrument(skip_all, err)]
     pub async fn from_env(conn: &mut AsyncPgConnection) -> Result<Self, Error> {
         let emails: Vec<String> = crates_io_env_vars::var(NOTIFICATION_EMAILS_ENV)

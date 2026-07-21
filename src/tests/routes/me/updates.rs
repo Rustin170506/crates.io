@@ -1,19 +1,21 @@
-use crate::schema::versions;
-use crate::tests::OkBool;
-use crate::tests::builders::{CrateBuilder, VersionBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
-use crate::views::EncodableVersion;
+use crate::OkBool;
+use crate::builders::{CrateBuilder, VersionBuilder};
+use crate::util::{RequestHelper, TestApp};
+use claims::assert_none;
+use crates_io::schema::versions;
+use crates_io::views::EncodableVersion;
 use diesel::prelude::*;
 use diesel::update;
 use diesel_async::RunQueryDsl;
 use googletest::prelude::*;
-use http::StatusCode;
 use insta::assert_snapshot;
+use serde::Deserialize;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn api_token_cannot_get_user_updates() {
     let (_, _, _, token) = TestApp::init().with_token().await;
-    token.get("/api/v1/me/updates").await.assert_forbidden();
+    let response = token.get::<()>("/api/v1/me/updates").await;
+    assert_snapshot!(response.status(), @"403 Forbidden");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -53,7 +55,7 @@ async fn following() {
         .await;
 
     let r: R = user.get("/api/v1/me/updates").await.good();
-    assert_that!(r.versions, empty());
+    assert_that!(r.versions, is_empty());
     assert!(!r.meta.more);
 
     user.put::<OkBool>("/api/v1/crates/foo_fighters/follow", b"" as &[u8])
@@ -96,12 +98,12 @@ async fn following() {
         .get_with_query("/api/v1/me/updates", "page=2&per_page=1")
         .await
         .good();
-    assert_that!(r.versions, empty());
+    assert_that!(r.versions, is_empty());
     assert!(!r.meta.more);
 
     let response = user
         .get_with_query::<()>("/api/v1/me/updates", "page=0")
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Failed to deserialize query string: page: invalid value: integer `0`, expected a nonzero u32"}]}"#);
 }

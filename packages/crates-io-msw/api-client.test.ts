@@ -1,0 +1,93 @@
+import { createClient } from '@crates-io/api-client';
+import { expect, test } from 'vitest';
+
+import { db } from './index.js';
+
+const baseUrl = 'https://crates.io/';
+
+test('GET /api/v1/site_metadata', async () => {
+  let client = createClient({ baseUrl });
+  let response = await client.GET('/api/v1/site_metadata');
+
+  expect(response.error).toBeUndefined();
+  expect(response.data).toMatchInlineSnapshot(`
+    {
+      "cdn_base": "https://static.crates.io",
+      "commit": "5048d31943118c6d67359bd207d307c854e82f45",
+      "deployed_sha": "5048d31943118c6d67359bd207d307c854e82f45",
+      "read_only": false,
+    }
+  `);
+});
+
+test('GET /api/v1/crates/{name}', async () => {
+  let crate = await db.crate.create({ name: 'serde' });
+  await db.version.create({ crate, num: '1.0.0' });
+
+  let client = createClient({ baseUrl });
+  let response = await client.GET('/api/v1/crates/{name}', {
+    params: {
+      path: { name: 'serde' },
+      query: { include: '' },
+    },
+  });
+
+  expect(response.error).toBeUndefined();
+  expect(response.data?.crate.name).toBe('serde');
+  expect(response.data).toMatchInlineSnapshot(`
+    {
+      "categories": null,
+      "crate": {
+        "badges": [],
+        "categories": null,
+        "created_at": "2010-06-16T21:30:45Z",
+        "default_version": "1.0.0",
+        "description": "This is the description for the crate called "serde"",
+        "documentation": null,
+        "downloads": 37035,
+        "exact_match": false,
+        "homepage": null,
+        "id": "serde",
+        "keywords": null,
+        "links": {
+          "owner_team": "/api/v1/crates/serde/owner_team",
+          "owner_user": "/api/v1/crates/serde/owner_user",
+          "reverse_dependencies": "/api/v1/crates/serde/reverse_dependencies",
+          "version_downloads": "/api/v1/crates/serde/downloads",
+          "versions": "/api/v1/crates/serde/versions",
+        },
+        "max_stable_version": null,
+        "max_version": "0.0.0",
+        "name": "serde",
+        "newest_version": "0.0.0",
+        "num_versions": 1,
+        "recent_downloads": 321,
+        "repository": null,
+        "trustpub_only": false,
+        "updated_at": "2017-02-24T12:34:56Z",
+        "versions": null,
+        "yanked": false,
+      },
+      "keywords": null,
+      "versions": null,
+    }
+  `);
+});
+
+test('GET /api/v1/crates/{name} error', async () => {
+  let client = createClient({ baseUrl });
+  let response = await client.GET('/api/v1/crates/{name}', {
+    params: { path: { name: 'serde' } },
+  });
+
+  expect(response.data).toBeUndefined();
+  expect(response.error).toMatchInlineSnapshot(`
+    {
+      "errors": [
+        {
+          "detail": "Not Found",
+        },
+      ],
+    }
+  `);
+});

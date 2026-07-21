@@ -1,5 +1,15 @@
 # Contributing to crates.io
 
+- [Attending the weekly team meetings](#attending-the-weekly-team-meetings)
+- [Using AI tools](#using-ai-tools)
+- [Finding an issue to work on](#finding-an-issue-to-work-on)
+- [Submitting a Pull Request](#submitting-a-pull-request)
+- [Reviewing Pull Requests](#reviewing-pull-requests)
+- [Checking Release State](#checking-release-state)
+- [Setting up a development environment](#setting-up-a-development-environment)
+  - [Working on the Frontend](#working-on-the-frontend)
+  - [Working on the Backend](#working-on-the-backend)
+
 ## Attending the weekly team meetings
 
 Each Friday at 11:00am US east coast time the crates.io team gets together
@@ -7,6 +17,11 @@ on Zoom or [Zulip] (`#t-crates-io`) for our weekly team meeting, and we invite
 everyone who wants to contribute to crates.io to participate.
 
 [Zulip]: https://rust-lang.zulipchat.com/#narrow/stream/318791-t-crates-io/
+
+## Using AI tools
+
+If you use AI tools to help draft issues, PRs, or comments, please
+review [`docs/AI-TOOLS.md`](AI-TOOLS.md) for our guidelines.
 
 ## Finding an issue to work on
 
@@ -36,7 +51,7 @@ a documentation comment on it, it'd be great if you could add one to it too.
 
 When you submit a pull request, it will be automatically tested on GitHub Actions. In
 addition to running both the frontend and the backend tests described below,
-GitHub Actions runs [jslint], [clippy], and [rustfmt] on each PR.
+GitHub Actions runs [ESLint], [clippy], and [rustfmt] on each PR.
 
 If you don't want to run these tools locally, please watch the GitHub Actions results
 and submit additional commits to your pull request to fix any issues they find!
@@ -47,7 +62,7 @@ instructions and the [.github/workflows/ci.yml] file in this repository for the 
 installation and running instructions. The logs for recent builds in GitHub Actions
 may also be helpful to see which versions of these tools we're currently using.
 
-[jslint]: http://jslint.com/
+[ESLint]: https://eslint.org/
 [clippy]: https://github.com/rust-lang-nursery/rust-clippy
 [rustfmt]: https://github.com/rust-lang-nursery/rustfmt
 [.github/workflows/ci.yml]: /.github/workflows/ci.yml
@@ -81,7 +96,39 @@ git clone https://github.com/rust-lang/crates.io.git
 cd crates.io/
 ```
 
-### Working on the Frontend
+### Quick start with devcontainers
+
+The repository ships a [devcontainer](../.devcontainer/README.md) that
+provides a full-stack development environment (Rust toolchain, Node.js,
+pnpm, Postgres 16, `diesel_cli`, Playwright) with all dependencies
+pre-installed. This is the recommended path for new contributors.
+
+- In VS Code with the [Dev Containers] extension: select "Reopen in
+  Container".
+- On GitHub: open a [Codespace] for the repository.
+- From the command line: `devcontainer up` (requires the
+  [`devcontainer` CLI]).
+
+The container's first start handles database creation, migrations, and
+dependency installation. See [`.devcontainer/README.md`](../.devcontainer/README.md)
+for details.
+
+Once the container is up, see:
+
+- [Building and serving the frontend](#building-and-serving-the-frontend)
+  for running the Svelte dev server (and choosing which backend it
+  proxies to).
+- [Starting the server and the frontend](#starting-the-server-and-the-frontend)
+  for running the local backend and background worker.
+
+The sections that follow also describe setting up the same environment
+manually if you prefer not to use containers.
+
+[Dev Containers]: https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers
+[Codespace]: https://docs.github.com/en/codespaces
+[`devcontainer` CLI]: https://github.com/devcontainers/cli
+
+## Working on the Frontend
 
 If the changes you'd like to make only involve:
 
@@ -100,11 +147,11 @@ you can run your frontend against the production API.
 If you need to set up the backend, you'll probably want to set up the frontend
 as well.
 
-#### Frontend requirements
+### Frontend requirements
 
 In order to run the frontend on Windows and macOS, you will need to have installed:
 
-- [node](https://nodejs.org/en/) >= 18.16.0 (see `package.json` and `.github/workflows/ci.yml` for what we currently use)
+- [node](https://nodejs.org/en/) (see `package.json` engines field for the exact version required)
 - [pnpm](https://pnpm.io) >= 8.5.1
 
 Follow the links for each of these tools for their recommended installation
@@ -117,61 +164,77 @@ to ensure that the use of `npm` does not require the use of `sudo`.
 The front end should run fine after these steps. Please file an issue if you run
 into any trouble.
 
-#### Building and serving the frontend
+### Building and serving the frontend
 
-To install the npm packages that crates.io uses, run:
+To install the npm packages that crates.io uses, run this from the repo root:
 
 ```console
 pnpm install
 ```
 
-You'll need to run these commands any time the libraries or versions of these
-libraries that crates.io uses change. Usually you'll know they've changed
-because you'll run the next step and it will fail saying it can't find some
-libraries.
+You'll need to run this any time the libraries or versions of these libraries
+that crates.io uses change. Usually you'll know they've changed because you'll
+run the next step and it will fail saying it can't find some libraries.
 
-To build and serve the frontend assets, use the command `pnpm start`. There
-are variations on this command that change which backend your frontend tries to
-talk to:
+To build and serve the frontend assets, change into the `svelte/` directory
+and run one of the `pnpm dev:*` scripts. They differ in which backend the dev
+server proxies to:
 
-| Command                                   | Backend                                   | Use case                                                |
-| ----------------------------------------- | ----------------------------------------- | ------------------------------------------------------- |
-| `pnpm start:live`                         | <https://crates.io>                       | Testing UI changes with the full live site's data       |
-| `pnpm start:staging`                      | <https://staging-crates-io.herokuapp.com> | Testing UI changes with a smaller set of realistic data |
-| `pnpm start:local`                        | Backend server running locally            | See the Working on the backend section for setup        |
-| `pnpm start -- --proxy https://crates.io` | Whatever is specified in `--proxy` arg    | If your use case is not covered here                    |
+| Command (from `svelte/`)                          | Backend                                   | Use case                                                |
+| ------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------- |
+| `pnpm dev:live`                                   | <https://crates.io>                       | Testing UI changes with the full live site's data       |
+| `pnpm dev:staging`                                | <https://staging.crates.io>               | Testing UI changes with a smaller set of realistic data |
+| `pnpm dev:local`                                  | Backend server running locally            | See ["Working on the Backend"](#working-on-the-backend) for setup |
+| `pnpm dev:msw`                                    | MSW handlers from `/packages/crates-io-msw/` | Testing UI changes against a fully-mocked backend       |
+| `API_HOST=https://crates.io pnpm dev`             | Whatever is in `API_HOST`                 | If your use case is not covered here                    |
 
-#### Running the frontend tests
+The dev server listens on <http://localhost:5173>.
 
-You can run the frontend tests with:
+### Running the frontend tests
+
+The Svelte app's Vitest unit and component tests:
 
 ```console
-pnpm test
+pnpm --filter crates.io-svelte test
 ```
 
-### Working on the Backend
+The MSW package's tests:
 
-#### Backend Requirements
+```console
+pnpm --filter "@crates-io/msw" test
+```
+
+Playwright tests (run from the repo root):
+
+```console
+pnpm e2e:svelte
+```
+
+## Working on the Backend
+
+### Backend Requirements
 
 In order to run the backend, you will need to have installed:
 
-- [Rust](https://www.rust-lang.org/en-US/) stable >= 1.56.0 and cargo, which comes with Rust
+- [Rust](https://www.rust-lang.org/en-US/) stable (see `rust-toolchain.toml` for version) and cargo, which comes with Rust
 - [Postgres](https://www.postgresql.org/) >= 9.5
 - [OpenSSL](https://www.openssl.org/) >= 1.0.2k
 - [diesel_cli](http://diesel.rs/guides/getting-started/) >= 2.0.0 and < 3.0.0
 
-##### Rust
+> [!NOTE]
+> The backend codebase assumes `cfg(unix)`. If you're running on Windows we recommend that you use
+> a WSL environment for development and follow the Linux instructions below.
+
+#### Rust
 
 - [rustup](https://rustup.rs/) is the installation method we'd recommend for
   all platforms.
 
-##### Postgres
+#### Postgres
 
 Postgres can be a little finicky to install and get set up. These are the
 methods we'd recommend for each operating system:
 
-- Windows: use the [Windows installers recommended by
-  Postgres](https://www.postgresql.org/download/windows/)
 - macOS: Either [Postgres.app](https://postgresapp.com/) or through
   [Homebrew](https://brew.sh/) by running `brew install postgresql@13` and
   following the post-installation instructions
@@ -181,7 +244,6 @@ methods we'd recommend for each operating system:
   as well as `postgresql-contrib`. Here
   are some examples of installation commands that have been tested for the
   following distributions:
-
   - Ubuntu: `sudo apt-get install postgresql postgresql-contrib libpq-dev pkg-config`
   - Fedora: `sudo dnf install postgresql-server postgresql-contrib postgresql-devel pkgconfig`
 
@@ -257,12 +319,17 @@ postgres`). Generally, the problem is that by default the postgres server is
 > we'll help fix the problem and will add the solution to these
 > instructions!
 
-##### OpenSSL
+Another option is to use a standalone Docker container for Postgres:
 
-- Windows: [Win32 OpenSSL Installation
-  Project](http://slproweb.com/products/Win32OpenSSL.html) provides installers
-  for the latest versions. Scroll down to “Download Win32 OpenSSL”, pick the
-  64-bit non-Light version of OpenSSL, and install it.
+```sh
+# example using postgres 16
+docker run -e POSTGRES_PASSWORD=password -e POSTGRES_INITDB_ARGS='--lc-collate=C --lc-ctype=C' -p 5432:5432 postgres:16
+# database URL will be
+# DATABASE_URL=postgres://postgres:password@localhost:5432/cargo_registry
+```
+
+#### OpenSSL
+
 - macOS: you can also install with homebrew by using `brew install openssl`
 - Linux: you should be able to use the distribution repositories. It will be
   called `openssl`, `openssl-devel`, or `libssl-dev`. OpenSSL needs
@@ -272,10 +339,11 @@ postgres`). Generally, the problem is that by default the postgres server is
   - Fedora: `sudo dnf install openssl-devel pkgconfig`
   - Arch Linux: `sudo pacman -S openssl pkg-config`
 
+> [!TIP]
 > If you have problems with OpenSSL, see [rust-openssl's
 > README](https://github.com/sfackler/rust-openssl) for some suggestions.
 
-##### `diesel_cli`
+#### `diesel_cli`
 
 On all platforms, install through `cargo` by running:
 
@@ -290,9 +358,9 @@ This will install a binary named `diesel`, so you should be able to run `diesel
 linking with `cc` failed: exit code: 1``, you're probably missing some
 > Postgres related libraries. See the Postgres section above on how to fix this.
 
-#### Building and serving the backend
+### Building and serving the backend
 
-##### Environment variables
+#### Environment variables
 
 Copy the `.env.sample` file to `.env`. Modify the settings as appropriate;
 minimally you'll need to specify or modify the value of the `DATABASE_URL` var.
@@ -327,7 +395,7 @@ Try using `postgres://postgres@localhost/cargo_registry` first.
 > For a guide to finding your pg_hba.conf file, check out [this post](https://askubuntu.com/questions/256534/how-do-i-find-the-path-to-pg-hba-conf-from-the-shell) on the Ubuntu Stack Exchange.
 > For information on updating your pg_hba.conf file and reloading it, see [this post](https://stackoverflow.com/questions/17996957/fe-sendauth-no-password-supplied) on Stack Overflow.
 
-##### Creating the database
+#### Creating the database
 
 You can name your development database anything as long as it matches the
 database name in the `DATABASE_URL` value. This example assumes a database
@@ -336,8 +404,13 @@ named `cargo_registry`.
 Create a new database by running:
 
 ```console
-createdb cargo_registry
+createdb --lc-collate=C --lc-ctype=C -T template0 cargo_registry
 ```
+
+The `C` collation is required because the `semver_ord` function stores
+prerelease identifiers as JSONB strings and relies on byte-wise comparison
+to match the SemVer spec's ASCII sort order. The same applies to
+`cargo_registry_test` below.
 
 Then run the migrations:
 
@@ -345,7 +418,7 @@ Then run the migrations:
 diesel migration run
 ```
 
-##### Setting up the git index
+#### Setting up the git index
 
 Set up the git repo for the crate index by running:
 
@@ -353,7 +426,15 @@ Set up the git repo for the crate index by running:
 ./script/init-local-index.sh
 ```
 
-##### Starting the server and the frontend
+#### Importing a database dump
+
+You can then import the database with
+
+```console
+./script/import-database-dump.sh
+```
+
+#### Starting the server and the frontend
 
 Build and start the server by running this command (you'll need to stop this
 with `CTRL-C` and rerun this command every time you change the backend code):
@@ -368,18 +449,25 @@ Then start the background worker (which will process uploaded READMEs):
 cargo run --bin background-worker
 ```
 
-Then start a frontend that uses this backend by running this command in another
-terminal session (the frontend picks up frontend changes using live reload
-without a restart needed, and you can leave the frontend running while you
-restart the server):
+Since crates.io is using the `tracing` crate, you can enable debug logging by
+setting the `RUST_LOG` environment variable to `debug` before running them, for
+example:
 
 ```console
-pnpm start:local
+RUST_LOG=debug cargo run --bin background-worker
+```
+Then start a frontend that uses this backend by running this command in another
+terminal session (the dev server picks up frontend changes via Vite HMR
+without a restart needed, and you can leave it running while you restart the
+backend):
+
+```console
+cd svelte && pnpm dev:local
 ```
 
-And then you should be able to visit <http://localhost:4200>!
+And then you should be able to visit <http://localhost:5173>!
 
-##### Using Mailgun to Send Emails
+#### Using Mailgun to Send Emails
 
 We currently have email functionality enabled for confirming a user's email
 address. In development, the sending of emails is simulated by a file
@@ -401,7 +489,7 @@ https://crates.io/confirm/RiphVyFo31wuKQhpyTw7RF2LIf
 ```
 
 When verifying the email, you need to change the prefix to your frontend host.
-For example, change the above link to `http://localhost:4200/confirm/RiphVyFo31wuKQhpyTw7RF2LIf`.
+For example, change the above link to `http://localhost:5173/confirm/RiphVyFo31wuKQhpyTw7RF2LIf`.
 
 If you want to test sending real emails, you will have to either set the
 Mailgun environment variables in `.env` manually or run your app instance
@@ -426,7 +514,7 @@ set up manually, log in to your account. If the variables were set through
 Heroku, you should be able to click on the Mailgun icon in your Heroku
 dashboard, which should take you to your Mailgun dashboard.
 
-#### Running the backend tests
+### Running the backend tests
 
 In your `.env` file, set `TEST_DATABASE_URL` to a value that's the same as
 `DATABASE_URL`, or use a different database name. The `TEST_DATABASE_URL`
@@ -438,7 +526,7 @@ Example: `postgres://postgres@localhost/cargo_registry_test`.
 Create the test database by running:
 
 ```console
-createdb cargo_registry_test
+createdb --lc-collate=C --lc-ctype=C -T template0 cargo_registry_test
 ```
 
 The test harness will ensure that migrations are run.
@@ -449,14 +537,14 @@ Run the backend API server tests with this command:
 cargo test
 ```
 
-#### Using your local crates.io with cargo
+### Using your local crates.io with cargo
 
-Once you have a local instance of crates.io running at <http://localhost:4200> by
+Once you have a local instance of crates.io running at <http://localhost:5173> by
 following the instructions in the "Working on the Backend" section, you can go
 to another Rust project and tell cargo to use your local crates.io instead of
 production.
 
-##### Publishing a crate to your local crates.io
+#### Publishing a crate to your local crates.io
 
 In order to publish a crate, you need an API token. In order to get an API
 token, you need to be able to log in with GitHub OAuth. In order to be able to
@@ -468,8 +556,8 @@ OAuth Applications](https://github.com/settings/developers) and click on the
 "Register a new application" button. Fill in the form as follows:
 
 - Application name: name your application whatever you'd like.
-- Homepage URL: `http://localhost:4200/`
-- Authorization callback URL: `http://localhost:4200/github-redirect.html`
+- Homepage URL: `http://localhost:5173/`
+- Authorization callback URL: `http://localhost:5173/github-redirect.html`
 
 Create the application, then take the Client ID ad Client Secret values and use
 them as the values of the `GH_CLIENT_ID` and `GH_CLIENT_SECRET` in your `.env`.
@@ -477,7 +565,7 @@ them as the values of the `GH_CLIENT_ID` and `GH_CLIENT_SECRET` in your `.env`.
 Then restart your backend, and you should be able to log in to your local
 crates.io with your GitHub account.
 
-Go to <http://localhost:4200/me> to get your API token and run the `cargo login`
+Go to <http://localhost:5173/me> to get your API token and run the `cargo login`
 command as directed.
 
 Now you should be able to go to the directory of a crate that has no
@@ -505,7 +593,7 @@ crate is downloaded. If you try to install a crate from your local crates.io and
 `cargo` can't find the crate files, it is probably because this directory does not
 exist.
 
-##### Downloading a crate from your local crates.io
+#### Downloading a crate from your local crates.io
 
 In _another_ crate, you can use the crate you've published as a dependency by
 telling `cargo` to replace crates.io with your local crates.io as a source.
@@ -533,92 +621,3 @@ this crate's `Cargo.toml`, and `cargo build` should display output like this:
    Compiling thiscrate v0.1.0 (file:///path/to/thiscrate)
     Finished dev [unoptimized + debuginfo] target(s) in 0.56 secs
 ```
-
-### Running crates.io with Docker
-
-There are Dockerfiles to build both the backend and the frontend,
-(`backend.Dockerfile` and `frontend.Dockerfile`) respectively, but it is most
-useful to just use docker-compose to bring up everything that's needed all in
-one go:
-
-```console
-docker compose up -d
-```
-
-The Compose file is filled out with a sane set of defaults that should Just
-Work™ out of the box without any modification. Individual settings can be
-overridden by creating a `docker-compose.override.yml` with the updated config.
-For example, in order to specify a set of Github OAuth Client credentials, a
-`docker-compose.override.yml` file might look like this:
-
-```yaml
-services:
-  backend:
-    environment:
-      GH_CLIENT_ID: blahblah_ID
-      GH_CLIENT_SECRET: blahblah_secret
-```
-
-These environment variables can also be defined in a local `.env` file, see `.env.sample`
-for various configuration options.
-
-#### Accessing services
-
-By default, the services will be exposed on their normal ports:
-
-- `5432` for Postgres
-- `8888` for the crates.io backend
-- `4200` for the crates.io frontend
-
-These can be changed with the `docker-compose.override.yml` file.
-
-#### Publishing crates
-
-Unlike a local setup, the Git index is not stored in the `./tmp` folder, so in
-order to publish to the Dockerized crates.io, run
-
-```console
-cargo publish --index http://localhost:8888/git/index --token $YOUR_TOKEN
-```
-
-#### Changing code
-
-The `app/` directory is mounted directly into the frontend Docker container,
-which means that the Ember live-reload server will still just work. If
-anything outside of `app/` is changed, the base Docker image will have to be
-rebuilt:
-
-```console
-# Rebuild frontend Docker image
-docker compose build frontend
-
-# Restart running frontend container (if it's already running)
-docker compose stop frontend
-docker compose rm frontend
-docker compose up -d
-```
-
-Similarly, the `src/` directory is mounted into the backend Docker container,
-so in order to recompile the backend, run:
-
-```console
-docker compose restart backend
-```
-
-If anything outside of `src/` is changed, the base Docker image will have to be
-rebuilt:
-
-```console
-# Rebuild backend Docker image
-docker compose build backend
-
-# Restart running backend container (if it's already running)
-docker compose stop backend
-docker compose rm backend
-docker compose up -d
-```
-
-#### Volumes
-
-A number of names volumes are created, as can be seen in the `volumes` section
-of the `docker-compose.yml` file.

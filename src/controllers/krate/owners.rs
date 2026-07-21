@@ -11,25 +11,27 @@ use crate::models::{
 use crate::util::errors::{AppResult, BoxedAppError, bad_request, crate_not_found, custom};
 use crate::views::EncodableOwner;
 use crate::{App, app::AppState};
-use crate::{auth::AuthCheck, email::Email};
+use crate::{auth::AuthCheck, email::EmailMessage};
 use axum::Json;
 use chrono::Utc;
-use crates_io_github::{GitHubClient, GitHubError};
+use crates_io_encryption::TokenEncryption;
+use crates_io_github::{GitHubAuth, GitHubClient, GitHubError};
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use http::StatusCode;
 use http::request::Parts;
-use oauth2::AccessToken;
-use secrecy::{ExposeSecret, SecretString};
+use minijinja::context;
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UsersResponse {
     pub users: Vec<EncodableOwner>,
 }
 
-/// List crate owners.
+/// Lists crate owners.
 #[utoipa::path(
     get,
     path = "/api/v1/crates/{name}/owners",
@@ -38,12 +40,12 @@ pub struct UsersResponse {
     responses((status = 200, description = "Successful Response", body = inline(UsersResponse))),
 )]
 pub async fn list_owners(state: AppState, path: CratePath) -> AppResult<Json<UsersResponse>> {
-    let mut conn = state.db_read().await?;
+    let conn = state.db_read().await?;
 
-    let krate = path.load_crate(&mut conn).await?;
+    let krate = path.load_crate(&conn).await?;
 
     let users = krate
-        .owners(&mut conn)
+        .owners(&conn)
         .await?
         .into_iter()
         .map(Owner::into)
@@ -57,7 +59,7 @@ pub struct TeamsResponse {
     pub teams: Vec<EncodableOwner>,
 }
 
-/// List team owners of a crate.
+/// Lists team owners of a crate.
 #[utoipa::path(
     get,
     path = "/api/v1/crates/{name}/owner_team",
@@ -66,10 +68,10 @@ pub struct TeamsResponse {
     responses((status = 200, description = "Successful Response", body = inline(TeamsResponse))),
 )]
 pub async fn get_team_owners(state: AppState, path: CratePath) -> AppResult<Json<TeamsResponse>> {
-    let mut conn = state.db_read().await?;
-    let krate = path.load_crate(&mut conn).await?;
+    let conn = state.db_read().await?;
+    let krate = path.load_crate(&conn).await?;
 
-    let teams = Team::owning(&krate, &mut conn)
+    let teams = Team::owning(&krate, &conn)
         .await?
         .into_iter()
         .map(Owner::into)
@@ -78,7 +80,7 @@ pub async fn get_team_owners(state: AppState, path: CratePath) -> AppResult<Json
     Ok(Json(TeamsResponse { teams }))
 }
 
-/// List user owners of a crate.
+/// Lists user owners of a crate.
 #[utoipa::path(
     get,
     path = "/api/v1/crates/{name}/owner_user",
@@ -87,11 +89,11 @@ pub async fn get_team_owners(state: AppState, path: CratePath) -> AppResult<Json
     responses((status = 200, description = "Successful Response", body = inline(UsersResponse))),
 )]
 pub async fn get_user_owners(state: AppState, path: CratePath) -> AppResult<Json<UsersResponse>> {
-    let mut conn = state.db_read().await?;
+    let conn = state.db_read().await?;
 
-    let krate = path.load_crate(&mut conn).await?;
+    let krate = path.load_crate(&conn).await?;
 
-    let users = User::owning(&krate, &mut conn)
+    let users = User::owning(&krate, &conn)
         .await?
         .into_iter()
         .map(Owner::into)
@@ -110,11 +112,12 @@ pub struct ModifyResponse {
     pub ok: bool,
 }
 
-/// Add crate owners.
+/// Adds crate owners.
 #[utoipa::path(
     put,
     path = "/api/v1/crates/{name}/owners",
     params(CratePath),
+    request_body = inline(ChangeOwnersRequest),
     security(
         ("api_token" = []),
         ("cookie" = []),
@@ -131,11 +134,12 @@ pub async fn add_owners(
     modify_owners(app, path.name, parts, body, true).await
 }
 
-/// Remove crate owners.
+/// Removes crate owners.
 #[utoipa::path(
     delete,
     path = "/api/v1/crates/{name}/owners",
     params(CratePath),
+    request_body = inline(ChangeOwnersRequest),
     security(
         ("api_token" = []),
         ("cookie" = []),
@@ -152,8 +156,13 @@ pub async fn remove_owners(
     modify_owners(app, path.name, parts, body, false).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ChangeOwnersRequest {
+    /// List of owner login names to add or remove.
+    ///
+    /// For users, use just the username (e.g., `"octocat"`).
+    /// For GitHub teams, use the format `github:org:team` (e.g., `"github:rust-lang:owners"`).
+    #[schema(example = json!(["octocat", "github:rust-lang:owners"]))]
     #[serde(alias = "users")]
     owners: Vec<String>,
 }
@@ -185,124 +194,127 @@ async fn modify_owners(
     let user = auth.user();
 
     let (msg, emails) = conn
-        .transaction(|conn| {
-            let app = app.clone();
-            async move {
-                let krate: Crate = Crate::by_name(&crate_name)
-                    .first(conn)
-                    .await
-                    .optional()?
-                    .ok_or_else(|| crate_not_found(&crate_name))?;
+        .transaction(async |conn| {
+            let krate: Crate = Crate::by_name(&crate_name)
+                .first(conn)
+                .await
+                .optional()?
+                .ok_or_else(|| crate_not_found(&crate_name))?;
 
-                let owners = krate.owners(conn).await?;
+            let owners = krate.owners(conn).await?;
 
-                match Rights::get(user, &*app.github, &owners).await? {
-                    Rights::Full => {}
-                    // Yes!
-                    Rights::Publish => {
-                        return Err(custom(
-                            StatusCode::FORBIDDEN,
-                            "team members don't have permission to modify owners",
-                        ));
-                    }
-                    Rights::None => {
-                        return Err(custom(
-                            StatusCode::FORBIDDEN,
-                            "only owners have permission to modify owners",
-                        ));
-                    }
+            match Rights::get(user, &*app.github, &owners, &app.config.token_encryption).await? {
+                Rights::Full => {}
+                // Yes!
+                Rights::Publish => {
+                    return Err(custom(
+                        StatusCode::FORBIDDEN,
+                        "team members don't have permission to modify owners",
+                    ));
                 }
+                Rights::None => {
+                    return Err(custom(
+                        StatusCode::FORBIDDEN,
+                        "only owners have permission to modify owners",
+                    ));
+                }
+            }
 
-                // The set of emails to send out after invite processing is complete and
-                // the database transaction has committed.
-                let mut emails = Vec::with_capacity(logins.len());
+            // The set of emails to send out after invite processing is complete and
+            // the database transaction has committed.
+            let mut emails = Vec::with_capacity(logins.len());
 
-                let comma_sep_msg = if add {
-                    let mut msgs = Vec::with_capacity(logins.len());
-                    for login in &logins {
-                        let login_test =
-                            |owner: &Owner| owner.login().to_lowercase() == *login.to_lowercase();
-                        if owners.iter().any(login_test) {
-                            return Err(bad_request(format_args!("`{login}` is already an owner")));
-                        }
+            let comma_sep_msg = if add {
+                let mut msgs = Vec::with_capacity(logins.len());
+                for login in &logins {
+                    let login_test =
+                        |owner: &Owner| owner.login().to_lowercase() == *login.to_lowercase();
+                    if owners.iter().any(login_test) {
+                        return Err(bad_request(format_args!("`{login}` is already an owner")));
+                    }
 
-                        match add_owner(&app, conn, user, &krate, login).await {
-                            // A user was successfully invited, and they must accept
-                            // the invite, and a best-effort attempt should be made
-                            // to email them the invite token for one-click
-                            // acceptance.
-                            Ok(NewOwnerInvite::User(invitee, token)) => {
-                                msgs.push(format!(
-                                    "user {} has been invited to be an owner of crate {}",
-                                    invitee.gh_login, krate.name,
-                                ));
+                    match add_owner(&app, conn, user, &krate, login).await {
+                        // A user was successfully invited, and they must accept
+                        // the invite, and a best-effort attempt should be made
+                        // to email them the invite token for one-click
+                        // acceptance.
+                        Ok(NewOwnerInvite::User(invitee, token)) => {
+                            msgs.push(format!(
+                                "user {} has been invited to be an owner of crate {}",
+                                invitee.gh_login, krate.name,
+                            ));
 
-                                if let Some(recipient) =
-                                    invitee.verified_email(conn).await.ok().flatten()
-                                {
-                                    emails.push(OwnerInviteEmail {
-                                        recipient_email_address: recipient,
-                                        inviter: user.gh_login.clone(),
-                                        domain: app.emails.domain.clone(),
-                                        crate_name: krate.name.clone(),
-                                        token,
-                                    });
+                            if let Some(recipient) =
+                                invitee.verified_email(conn).await.ok().flatten()
+                            {
+                                let email = EmailMessage::from_template(
+                                    "owner_invite",
+                                    context! {
+                                        inviter => user.gh_login,
+                                        domain => app.emails.domain,
+                                        crate_name => krate.name,
+                                        token => token.expose_secret()
+                                    },
+                                );
+
+                                match email {
+                                    Ok(email_msg) => emails.push((recipient, email_msg)),
+                                    Err(error) => warn!(
+                                        "Failed to render owner invite email template: {error}"
+                                    ),
                                 }
                             }
+                        }
 
-                            // A team was successfully invited. They are immediately
-                            // added, and do not have an invite token.
-                            Ok(NewOwnerInvite::Team(team)) => msgs.push(format!(
-                                "team {} has been added as an owner of crate {}",
-                                team.login, krate.name
-                            )),
+                        // A team was successfully invited. They are immediately
+                        // added, and do not have an invite token.
+                        Ok(NewOwnerInvite::Team(team)) => msgs.push(format!(
+                            "team {} has been added as an owner of crate {}",
+                            team.login, krate.name
+                        )),
 
-                            // This user has a pending invite.
-                            Err(OwnerAddError::AlreadyInvited(user)) => msgs.push(format!(
+                        // This user has a pending invite.
+                        Err(OwnerAddError::AlreadyInvited(user)) => msgs.push(format!(
                             "user {} already has a pending invitation to be an owner of crate {}",
                             user.gh_login, krate.name
                         )),
 
-                            // An opaque error occurred.
-                            Err(OwnerAddError::Diesel(e)) => return Err(e.into()),
-                            Err(OwnerAddError::AppError(e)) => return Err(e),
-                        }
+                        // An opaque error occurred.
+                        Err(OwnerAddError::Diesel(e)) => return Err(e.into()),
+                        Err(OwnerAddError::AppError(e)) => return Err(e),
                     }
-                    msgs.join(",")
-                } else {
-                    for login in &logins {
-                        krate.owner_remove(conn, login).await?;
-                    }
-                    if User::owning(&krate, conn).await?.is_empty() {
-                        return Err(bad_request(
-                            "cannot remove all individual owners of a crate. \
+                }
+                msgs.join(",")
+            } else {
+                for login in &logins {
+                    krate.owner_remove(conn, login).await?;
+                }
+                if User::owning(&krate, conn).await?.is_empty() {
+                    return Err(bad_request(
+                        "cannot remove all individual owners of a crate. \
                      Team member don't have permission to modify owners, so \
                      at least one individual owner is required.",
-                        ));
-                    }
-                    "owners successfully removed".to_owned()
-                };
+                    ));
+                }
+                "owners successfully removed".to_owned()
+            };
 
-                Ok((comma_sep_msg, emails))
-            }
-            .scope_boxed()
+            Ok((comma_sep_msg, emails))
         })
         .await?;
 
     // Send the accumulated invite emails now the database state has
     // committed.
-    for email in emails {
-        let addr = email.recipient_email_address().to_string();
-
-        if let Err(e) = app.emails.send(&addr, email).await {
-            warn!("Failed to send co-owner invite email: {e}");
+    for (recipient, email) in emails {
+        if let Err(error) = app.emails.send(&recipient, email).await {
+            warn!("Failed to send owner invite email to {recipient}: {error}");
         }
     }
 
     Ok(Json(ModifyResponse { msg, ok: true }))
 }
 
-/// Invite `login` as an owner of this crate, returning the created
+/// Invites `login` as an owner of this crate, returning the created
 /// [`NewOwnerInvite`].
 async fn add_owner(
     app: &App,
@@ -312,7 +324,8 @@ async fn add_owner(
     login: &str,
 ) -> Result<NewOwnerInvite, OwnerAddError> {
     if login.contains(':') {
-        add_team_owner(&*app.github, conn, req_user, krate, login).await
+        let encryption = &app.config.token_encryption;
+        add_team_owner(&*app.github, conn, req_user, krate, login, encryption).await
     } else {
         invite_user_owner(app, conn, req_user, krate, login).await
     }
@@ -355,6 +368,7 @@ async fn add_team_owner(
     req_user: &User,
     krate: &Crate,
     login: &str,
+    encryption: &TokenEncryption,
 ) -> Result<NewOwnerInvite, OwnerAddError> {
     // github:rust-lang:owners
     let mut chunks = login.split(':');
@@ -373,9 +387,16 @@ async fn add_team_owner(
     })?;
 
     // Always recreate teams to get the most up-to-date GitHub ID
-    let team =
-        create_or_update_github_team(gh_client, conn, &login.to_lowercase(), org, team, req_user)
-            .await?;
+    let team = create_or_update_github_team(
+        gh_client,
+        conn,
+        &login.to_lowercase(),
+        org,
+        team,
+        req_user,
+        encryption,
+    )
+    .await?;
 
     // Teams are added as owners immediately, since the above call ensures
     // the user is a team member.
@@ -390,7 +411,7 @@ async fn add_team_owner(
     Ok(NewOwnerInvite::Team(team))
 }
 
-/// Tries to create or update a Github Team. Assumes `org` and `team` are
+/// Tries to create or update a GitHub Team. Assumes `org` and `team` are
 /// correctly parsed out of the full `name`. `name` is passed as a
 /// convenience to avoid rebuilding it.
 pub async fn create_or_update_github_team(
@@ -400,6 +421,7 @@ pub async fn create_or_update_github_team(
     org_name: &str,
     team_name: &str,
     req_user: &User,
+    encryption: &TokenEncryption,
 ) -> AppResult<Team> {
     // GET orgs/:org/teams
     // check that `team` is the `slug` in results, and grab its data
@@ -416,8 +438,17 @@ pub async fn create_or_update_github_team(
         )));
     }
 
-    let token = AccessToken::new(req_user.gh_access_token.expose_secret().to_string());
-    let team = gh_client.team_by_name(org_name, team_name, &token).await
+    let token = encryption
+        .decrypt(&req_user.gh_encrypted_token)
+        .map_err(|err| {
+            custom(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to decrypt GitHub token: {err}"),
+            )
+        })?;
+
+    let auth = GitHubAuth::bearer(token);
+    let team = gh_client.team_by_name(org_name, team_name, &auth).await
         .map_err(|_| {
             bad_request(format_args!(
                 "could not find the github team {org_name}/{team_name}. \
@@ -430,12 +461,12 @@ pub async fn create_or_update_github_team(
     let gh_login = &req_user.gh_login;
 
     let is_team_member = gh_client
-        .team_membership(org_id, team.id, gh_login, &token)
+        .team_membership(org_id, team.id, gh_login, &auth)
         .await?
         .is_some_and(|m| m.is_active());
 
     let can_add_team =
-        is_team_member || is_gh_org_owner(gh_client, org_id, gh_login, &token).await?;
+        is_team_member || is_gh_org_owner(gh_client, org_id, gh_login, &auth).await?;
 
     if !can_add_team {
         return Err(custom(
@@ -444,7 +475,7 @@ pub async fn create_or_update_github_team(
         ));
     }
 
-    let org = gh_client.org_by_name(org_name, &token).await?;
+    let org = gh_client.org_by_name(org_name, &auth).await?;
 
     NewTeam::builder()
         .login(&login.to_lowercase())
@@ -462,13 +493,13 @@ async fn is_gh_org_owner(
     gh_client: &dyn GitHubClient,
     org_id: i32,
     gh_login: &str,
-    token: &AccessToken,
+    auth: &GitHubAuth,
 ) -> Result<bool, GitHubError> {
-    let membership = gh_client.org_membership(org_id, gh_login, token).await?;
+    let membership = gh_client.org_membership(org_id, gh_login, auth).await?;
     Ok(membership.is_some_and(|m| m.is_active_admin()))
 }
 
-/// Error results from a [`add_owner()`] model call.
+/// Error results from an [`add_owner()`] call.
 #[derive(Debug, Error)]
 enum OwnerAddError {
     #[error(transparent)]
@@ -501,43 +532,5 @@ impl From<OwnerRemoveError> for BoxedAppError {
                 bad_request(format!("could not find owner with login `{login}`"))
             }
         }
-    }
-}
-
-pub struct OwnerInviteEmail {
-    /// The destination email address for this email.
-    recipient_email_address: String,
-
-    /// Email body variables.
-    inviter: String,
-    domain: String,
-    crate_name: String,
-    token: SecretString,
-}
-
-impl OwnerInviteEmail {
-    pub fn recipient_email_address(&self) -> &str {
-        &self.recipient_email_address
-    }
-}
-
-impl Email for OwnerInviteEmail {
-    fn subject(&self) -> String {
-        format!(
-            "crates.io: Ownership invitation for \"{}\"",
-            self.crate_name
-        )
-    }
-
-    fn body(&self) -> String {
-        format!(
-            "{user_name} has invited you to become an owner of the crate {crate_name}!\n
-Visit https://{domain}/accept-invite/{token} to accept this invitation,
-or go to https://{domain}/me/pending-invites to manage all of your crate ownership invitations.",
-            user_name = self.inviter,
-            domain = self.domain,
-            crate_name = self.crate_name,
-            token = self.token.expose_secret(),
-        )
     }
 }

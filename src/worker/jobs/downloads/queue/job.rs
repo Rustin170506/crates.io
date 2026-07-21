@@ -9,7 +9,9 @@ use aws_sdk_sqs::types::Message;
 use crates_io_worker::BackgroundJob;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{debug, info, instrument, warn};
 
 /// A background job that processes messages from the CDN log queue.
 ///
@@ -37,7 +39,7 @@ impl BackgroundJob for ProcessCdnLogQueue {
     }
 }
 
-/// Builds an [SqsQueue] implementation based on the [CdnLogQueueConfig].
+/// Builds an [`SqsQueue`] implementation based on the [`CdnLogQueueConfig`].
 fn build_queue(config: &CdnLogQueueConfig) -> Box<dyn SqsQueue + Send + Sync> {
     match config {
         CdnLogQueueConfig::Mock => Box::new(MockSqsQueue::new()),
@@ -61,7 +63,7 @@ fn build_queue(config: &CdnLogQueueConfig) -> Box<dyn SqsQueue + Send + Sync> {
 
 /// Processes messages from the CDN log queue.
 ///
-/// This function is separate from the [BackgroundJob] implementation so that it
+/// This function is separate from the [`BackgroundJob`] implementation so that it
 /// can be tested without needing to construct a full [Environment] struct.
 async fn run(
     queue: &impl SqsQueue,
@@ -153,9 +155,9 @@ async fn process_body(body: &str, connection_pool: &Pool<AsyncPgConnection>) -> 
     }
 
     let conn = connection_pool.get().await;
-    let mut conn = conn.context("Failed to acquire database connection")?;
+    let conn = conn.context("Failed to acquire database connection")?;
 
-    enqueue_jobs(jobs, &mut conn).await
+    enqueue_jobs(jobs, &conn).await
 }
 
 /// Extracts a list of [`ProcessCdnLog`] jobs from a message.
@@ -201,10 +203,7 @@ fn is_ignored_path(path: &str) -> bool {
     path.contains("/index.staging.crates.io/") || path.contains("/index.crates.io/")
 }
 
-async fn enqueue_jobs(
-    jobs: Vec<ProcessCdnLog>,
-    conn: &mut AsyncPgConnection,
-) -> anyhow::Result<()> {
+async fn enqueue_jobs(jobs: Vec<ProcessCdnLog>, conn: &AsyncPgConnection) -> anyhow::Result<()> {
     for job in jobs {
         let path = &job.path;
 
@@ -225,6 +224,7 @@ mod tests {
     use aws_sdk_sqs::operation::receive_message::builders::ReceiveMessageOutputBuilder;
     use aws_sdk_sqs::types::Message;
     use aws_sdk_sqs::types::builders::MessageBuilder;
+    use claims::assert_ok;
     use crates_io_test_db::TestDatabase;
     use crates_io_worker::schema::background_jobs;
     use diesel::prelude::*;
@@ -261,7 +261,7 @@ mod tests {
         assert_ok!(run(&queue, 100, &connection_pool).await);
 
         assert_snapshot!(deleted_handles.lock().join(","), @"123");
-        assert_snapshot!(open_jobs(&mut connection_pool.get().await.unwrap()).await, @"us-west-1 | bucket | path");
+        assert_snapshot!(open_jobs(&connection_pool.get().await.unwrap()).await, @"us-west-1 | bucket | path");
     }
 
     #[tokio::test]
@@ -309,7 +309,7 @@ mod tests {
         assert_ok!(run(&queue, 100, &connection_pool).await);
 
         assert_snapshot!(deleted_handles.lock().join(","), @"1,2,3,4,5,6,7,8,9,10,11");
-        assert_snapshot!(open_jobs(&mut connection_pool.get().await.unwrap()).await, @r"
+        assert_snapshot!(open_jobs(&connection_pool.get().await.unwrap()).await, @r"
         us-west-1 | bucket | path1
         us-west-1 | bucket | path2
         us-west-1 | bucket | path3
@@ -357,7 +357,7 @@ mod tests {
         assert_ok!(run(&queue, 100, &connection_pool).await);
 
         assert_snapshot!(deleted_handles.lock().join(","), @"1");
-        assert_snapshot!(open_jobs(&mut connection_pool.get().await.unwrap()).await, @"");
+        assert_snapshot!(open_jobs(&connection_pool.get().await.unwrap()).await, @"");
     }
 
     #[test]
@@ -418,10 +418,10 @@ mod tests {
             .build()
     }
 
-    async fn open_jobs(conn: &mut AsyncPgConnection) -> String {
+    async fn open_jobs(mut conn: &AsyncPgConnection) -> String {
         let jobs = background_jobs::table
             .select((background_jobs::job_type, background_jobs::data))
-            .load::<(String, serde_json::Value)>(conn)
+            .load::<(String, serde_json::Value)>(&mut conn)
             .await
             .unwrap();
 

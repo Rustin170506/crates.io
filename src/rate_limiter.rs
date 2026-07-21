@@ -1,7 +1,8 @@
 use crate::schema::{publish_limit_buckets, publish_rate_overrides};
 use crate::util::errors::{AppResult, TooManyRequests};
 use chrono::{DateTime, Utc};
-use crates_io_diesel_helpers::{date_part, floor, greatest, interval_part, least, pg_enum};
+use crates_io_database::fns::{date_part, floor, greatest, interval_part, least};
+use crates_io_database::pg_enum;
 use diesel::dsl::IntervalDsl;
 use diesel::prelude::*;
 use diesel::sql_types::Interval;
@@ -95,7 +96,7 @@ impl RateLimiter {
         }
     }
 
-    /// Refill a user's bucket as needed, take a token from it,
+    /// Refills a user's bucket as needed, takes a token from it,
     /// and returns the result.
     ///
     /// The number of tokens remaining will always be between 0 and self.burst.
@@ -154,6 +155,7 @@ impl RateLimiter {
                 publish_limit_buckets::last_refill.eq(publish_limit_buckets::last_refill
                     + refill_rate.into_sql::<Interval>() * tokens_to_add),
             ))
+            .returning(Bucket::as_returning())
             .get_result(conn)
             .await
     }
@@ -170,8 +172,8 @@ impl RateLimiter {
     }
 }
 
-#[derive(Queryable, Insertable, Debug, PartialEq, Clone, Copy)]
-#[diesel(table_name = publish_limit_buckets, check_for_backend(diesel::pg::Pg))]
+#[derive(HasQuery, Insertable, Debug, PartialEq, Clone, Copy)]
+#[diesel(table_name = publish_limit_buckets)]
 #[allow(dead_code)] // Most fields only read in tests
 struct Bucket {
     user_id: i32,
@@ -185,6 +187,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDateTime;
     use crates_io_test_db::TestDatabase;
+    use crates_io_test_utils::builders::UserBuilder;
 
     #[tokio::test]
     async fn default_rate_limits() -> anyhow::Result<()> {
@@ -701,16 +704,11 @@ mod tests {
     }
 
     async fn new_user(conn: &mut AsyncPgConnection, gh_login: &str) -> QueryResult<i32> {
-        use crate::models::NewUser;
-
-        NewUser::builder()
-            .gh_id(0)
-            .gh_login(gh_login)
-            .gh_access_token("some random token")
-            .build()
+        UserBuilder::new()
+            .with_username(gh_login)
+            .new_user()
             .insert(conn)
             .await
-            .map(|user| user.id)
     }
 
     async fn new_user_bucket(
@@ -725,6 +723,7 @@ mod tests {
                 last_refill: now,
                 action: LimitedAction::PublishNew,
             })
+            .returning(Bucket::as_returning())
             .get_result(conn)
             .await
     }

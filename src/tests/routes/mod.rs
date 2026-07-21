@@ -19,5 +19,7 @@ pub mod me;
 pub mod metrics;
 mod private;
 pub mod session;
+mod site_metadata;
 pub mod summary;
+mod trustpub;
 pub mod users;

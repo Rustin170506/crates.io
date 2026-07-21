@@ -3,9 +3,10 @@
 //! see <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html#LogFileFormat>
 //! and <https://www.w3.org/TR/WD-logfile.html>.
 
-use crate::paths::parse_path;
 use crate::DownloadsMap;
-use chrono::NaiveDate;
+use crate::date::parse_date;
+use crate::paths::parse_path;
+use crate::user_agent::should_count_user_agent;
 use std::borrow::Cow;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::{instrument, warn};
@@ -18,6 +19,7 @@ const FIELD_DATE: &str = "date";
 const FIELD_METHOD: &str = "cs-method";
 const FIELD_PATH: &str = "cs-uri-stem";
 const FIELD_STATUS: &str = "sc-status";
+const FIELD_USER_AGENT: &str = "cs(User-Agent)";
 
 #[instrument(level = "debug", skip(reader))]
 pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Result<DownloadsMap> {
@@ -26,6 +28,7 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
     let mut method_index = None;
     let mut path_index = None;
     let mut status_index = None;
+    let mut user_agent_index = None;
 
     let mut downloads = DownloadsMap::new();
 
@@ -47,6 +50,7 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
             method_index = fields.iter().position(|f| f == &FIELD_METHOD);
             path_index = fields.iter().position(|f| f == &FIELD_PATH);
             status_index = fields.iter().position(|f| f == &FIELD_STATUS);
+            user_agent_index = fields.iter().position(|f| f == &FIELD_USER_AGENT);
 
             continue;
         }
@@ -56,27 +60,60 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
             continue;
         }
 
-        let values = line.split('\t').collect::<Vec<_>>();
+        let mut num_values = 0;
+        let mut date = None;
+        let mut method = None;
+        let mut path = None;
+        let mut status = None;
+        let mut user_agent = None;
+        for (i, value) in line.split('\t').enumerate() {
+            let index = Some(i);
+            if index == date_index {
+                date = Some(value);
+            } else if index == method_index {
+                method = Some(value);
+            } else if index == path_index {
+                path = Some(value);
+            } else if index == status_index {
+                status = Some(value);
+            } else if index == user_agent_index {
+                user_agent = Some(value);
+            }
+            num_values = i + 1;
+        }
 
-        let num_values = values.len();
         if num_values != num_fields {
             warn!("Expected {num_fields} fields, but found {num_values}");
             continue;
         }
 
-        let method = get_value(&values, method_index, FIELD_METHOD);
+        let Some(method) = method else {
+            warn!("Failed to find {FIELD_METHOD} field.");
+            continue;
+        };
         if method != "GET" {
             // Ignore non-GET requests.
             continue;
         }
 
-        let status = get_value(&values, status_index, FIELD_STATUS);
+        let Some(status) = status else {
+            warn!("Failed to find {FIELD_STATUS} field.");
+            continue;
+        };
         if status != "200" {
             // Ignore non-200 responses.
             continue;
         }
 
-        let path = get_value(&values, path_index, FIELD_PATH);
+        if user_agent.is_some_and(|ua| !should_count_user_agent(ua)) {
+            // Ignore requests from user agents that should not be counted.
+            continue;
+        }
+
+        let Some(path) = path else {
+            warn!("Failed to find {FIELD_PATH} field.");
+            continue;
+        };
 
         // Deal with paths like `/crates/tikv-jemalloc-sys/tikv-jemalloc-sys-0.5.4%252B5.3.0-patched.crate`.
         //
@@ -90,13 +127,13 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
             continue;
         };
 
-        let date = get_value(&values, date_index, FIELD_DATE);
-        let date = match date.parse::<NaiveDate>() {
-            Ok(date) => date,
-            Err(error) => {
-                warn!(%date, %error, "Failed to parse date");
-                continue;
-            }
+        let Some(date) = date else {
+            warn!("Failed to find {FIELD_DATE} field.");
+            continue;
+        };
+        let Some(date) = parse_date(date) else {
+            warn!("Failed to parse date `{date}`");
+            continue;
         };
 
         downloads.add(name, version, date);
@@ -108,16 +145,6 @@ pub async fn count_downloads(reader: impl AsyncBufRead + Unpin) -> anyhow::Resul
 #[instrument(level = "debug", skip(path))]
 fn decode_path(path: &str) -> Cow<'_, str> {
     percent_encoding::percent_decode_str(path).decode_utf8_lossy()
-}
-
-fn get_value<'a>(values: &'a [&'a str], index: Option<usize>, field_name: &'static str) -> &'a str {
-    index
-        .and_then(|i| values.get(i))
-        .copied()
-        .unwrap_or_else(|| {
-            warn!(?index, "Failed to find {field_name} field.");
-            ""
-        })
 }
 
 #[cfg(test)]
@@ -149,7 +176,6 @@ mod tests {
             2024-01-17  flatbuffers@23.1.21 .. 1
             2024-01-17  jemallocator@0.5.4 .. 1
             2024-01-17  leveldb-sys@2.0.9 .. 1
-            2024-01-17  num_cpus@1.15.0 .. 1
             2024-01-17  paste@1.0.12 .. 1
             2024-01-17  quick-error@1.2.3 .. 1
             2024-01-17  rand@0.8.5 .. 1

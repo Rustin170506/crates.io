@@ -1,11 +1,14 @@
 use crate::schema::{crates, versions};
-use crate::storage::FeedId;
+use crate::storage::StorageKey;
 use crate::worker::Environment;
 use chrono::{Duration, Utc};
+use crates_io_database::models::CloudFrontDistribution;
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 #[derive(Serialize, Deserialize)]
 pub struct SyncUpdatesFeed;
@@ -28,15 +31,15 @@ impl BackgroundJob for SyncUpdatesFeed {
     type Context = Arc<Environment>;
 
     async fn run(&self, ctx: Self::Context) -> anyhow::Result<()> {
-        let feed_id = FeedId::Updates;
+        let key = StorageKey::UpdatesFeed;
         let domain = &ctx.config.domain_name;
 
         info!("Loading latest {NUM_ITEMS} version updates from the database…");
-        let mut conn = ctx.deadpool.get().await?;
-        let version_updates = load_version_updates(&mut conn).await?;
+        let conn = ctx.deadpool.get().await?;
+        let version_updates = load_version_updates(&conn).await?;
 
         let link = rss::extension::atom::Link {
-            href: ctx.storage.feed_url(&feed_id),
+            href: ctx.storage.location(&key),
             rel: "self".to_string(),
             mime_type: Some("application/rss+xml".to_string()),
             ..Default::default()
@@ -61,11 +64,14 @@ impl BackgroundJob for SyncUpdatesFeed {
             ..Default::default()
         };
 
-        info!("Uploading feed to storage…");
-        ctx.storage.upload_feed(&feed_id, &channel).await?;
+        let path = key.path();
 
-        let path = object_store::path::Path::from(&feed_id);
-        if let Err(error) = ctx.invalidate_cdns(path.as_ref()).await {
+        info!("Uploading feed to storage…");
+        let bytes = super::serialize_channel(&channel)?;
+        ctx.storage.upload(&key, bytes.into()).await?;
+
+        let dist = CloudFrontDistribution::Static;
+        if let Err(error) = ctx.invalidate_cdns(&conn, dist, path.as_ref()).await {
             warn!("Failed to invalidate CDN caches: {error}");
         }
 
@@ -80,15 +86,13 @@ impl BackgroundJob for SyncUpdatesFeed {
 /// than [`ALWAYS_INCLUDE_AGE`]. If there are less than [`NUM_ITEMS`] versions
 /// then the list will be padded with older versions until [`NUM_ITEMS`] are
 /// returned.
-async fn load_version_updates(conn: &mut AsyncPgConnection) -> QueryResult<Vec<VersionUpdate>> {
+async fn load_version_updates(mut conn: &AsyncPgConnection) -> QueryResult<Vec<VersionUpdate>> {
     let threshold_dt = chrono::Utc::now().naive_utc() - ALWAYS_INCLUDE_AGE;
 
-    let updates = versions::table
-        .inner_join(crates::table)
+    let updates = VersionUpdate::query()
         .filter(versions::created_at.gt(threshold_dt))
         .order(versions::created_at.desc())
-        .select(VersionUpdate::as_select())
-        .load(conn)
+        .load(&mut conn)
         .await?;
 
     let num_updates = updates.len();
@@ -96,17 +100,15 @@ async fn load_version_updates(conn: &mut AsyncPgConnection) -> QueryResult<Vec<V
         return Ok(updates);
     }
 
-    versions::table
-        .inner_join(crates::table)
+    VersionUpdate::query()
         .order(versions::created_at.desc())
-        .select(VersionUpdate::as_select())
         .limit(NUM_ITEMS)
-        .load(conn)
+        .load(&mut conn)
         .await
 }
 
-#[derive(Debug, Queryable, Selectable)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, HasQuery)]
+#[diesel(base_query = versions::table.inner_join(crates::table))]
 struct VersionUpdate {
     #[diesel(select_expression = crates::columns::name)]
     name: String,
@@ -168,6 +170,7 @@ impl VersionUpdate {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+    use claims::assert_ok;
     use crates_io_test_db::TestDatabase;
     use futures_util::future::join_all;
     use insta::assert_debug_snapshot;
@@ -183,21 +186,21 @@ mod tests {
 
         let now = chrono::Utc::now();
 
-        let updates = assert_ok!(load_version_updates(&mut conn).await);
+        let updates = assert_ok!(load_version_updates(&conn).await);
         assert_eq!(updates.len(), 0);
 
         let foo = create_crate(&mut conn, "foo").await;
 
         // If there are less than NUM_ITEMS versions, they should all be returned
         let futures = [
-            create_version(&mut conn, foo, "1.0.0", now - Duration::days(123)),
-            create_version(&mut conn, foo, "1.0.1", now - Duration::days(110)),
-            create_version(&mut conn, foo, "1.1.0", now - Duration::days(100)),
-            create_version(&mut conn, foo, "1.2.0", now - Duration::days(90)),
+            create_version(&conn, foo, "1.0.0", now - Duration::days(123)),
+            create_version(&conn, foo, "1.0.1", now - Duration::days(110)),
+            create_version(&conn, foo, "1.1.0", now - Duration::days(100)),
+            create_version(&conn, foo, "1.2.0", now - Duration::days(90)),
         ];
         join_all(futures).await;
 
-        let updates = assert_ok!(load_version_updates(&mut conn).await);
+        let updates = assert_ok!(load_version_updates(&conn).await);
         assert_eq!(updates.len(), 4);
         assert_debug_snapshot!(updates.iter().map(|u| &u.version).collect::<Vec<_>>());
 
@@ -206,11 +209,11 @@ mod tests {
         for i in 1..=NUM_ITEMS {
             let version = format!("1.2.{i}");
             let publish_time = now - Duration::days(90) + Duration::hours(i);
-            futures.push(create_version(&mut conn, foo, version, publish_time));
+            futures.push(create_version(&conn, foo, version, publish_time));
         }
         join_all(futures).await;
 
-        let updates = assert_ok!(load_version_updates(&mut conn).await);
+        let updates = assert_ok!(load_version_updates(&conn).await);
         assert_eq!(updates.len() as i64, NUM_ITEMS);
         assert_debug_snapshot!(updates.iter().map(|u| &u.version).collect::<Vec<_>>());
 
@@ -219,11 +222,11 @@ mod tests {
         for i in 1..=(NUM_ITEMS + 10) {
             let version = format!("1.3.{i}");
             let publish_time = now - Duration::minutes(30) + Duration::seconds(i);
-            futures.push(create_version(&mut conn, foo, version, publish_time));
+            futures.push(create_version(&conn, foo, version, publish_time));
         }
         join_all(futures).await;
 
-        let updates = assert_ok!(load_version_updates(&mut conn).await);
+        let updates = assert_ok!(load_version_updates(&conn).await);
         assert_eq!(updates.len() as i64, NUM_ITEMS + 10);
         assert_debug_snapshot!(updates.iter().map(|u| &u.version).collect::<Vec<_>>());
     }
@@ -238,11 +241,11 @@ mod tests {
     }
 
     fn create_version<T: Into<Cow<'static, str>>>(
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
         crate_id: i32,
         version: T,
         publish_time: DateTime<Utc>,
-    ) -> impl Future<Output = i32> + use<T> {
+    ) -> impl Future<Output = i32> + use<'_, T> {
         let version = version.into();
         let future = diesel::insert_into(versions::table)
             .values((
@@ -251,11 +254,11 @@ mod tests {
                 versions::num_no_build.eq(version),
                 versions::created_at.eq(publish_time),
                 versions::updated_at.eq(publish_time),
-                versions::checksum.eq("checksum"),
+                versions::tar_sha256.eq(vec![0u8; 32]),
                 versions::crate_size.eq(0),
             ))
             .returning(versions::id)
-            .get_result(conn);
+            .get_result(&mut conn);
 
         async move { future.await.unwrap() }
     }

@@ -1,21 +1,23 @@
 pub mod app;
-mod block_traffic;
+pub mod block_traffic;
 pub mod cargo_compat;
 mod common_headers;
 mod debug;
-mod ember_html;
+mod frontend_html;
 pub mod log_request;
 pub mod normalize_path;
 pub mod real_ip;
 mod require_user_agent;
 mod static_or_continue;
+mod svelte_redirect;
 mod update_metrics;
 
 use ::sentry::integrations::tower as sentry_tower;
 use axum::Router;
-use axum::middleware::{from_fn, from_fn_with_state};
+use axum::middleware::{ResponseAxumBodyLayer, from_fn, from_fn_with_state};
 use axum_extra::either::Either;
 use axum_extra::middleware::option_layer;
+use http::StatusCode;
 use std::time::Duration;
 use tower::layer::util::Identity;
 use tower_http::add_extension::AddExtensionLayer;
@@ -39,7 +41,7 @@ pub fn apply_axum_middleware(state: AppState, router: Router<()>) -> Router {
 
     let middlewares_1 = tower::ServiceBuilder::new()
         .layer(sentry_tower::NewSentryLayer::new_from_top())
-        .layer(sentry_tower::SentryHttpLayer::with_transaction())
+        .layer(sentry_tower::SentryHttpLayer::new().enable_transaction())
         .layer(from_fn(self::real_ip::middleware))
         .layer(from_fn(log_request::log_requests))
         .layer(CatchPanicLayer::new())
@@ -67,29 +69,35 @@ pub fn apply_axum_middleware(state: AppState, router: Router<()>) -> Router {
             require_user_agent::require_user_agent,
         ))
         .layer(from_fn_with_state(state.clone(), block_traffic::middleware))
-        .layer(from_fn_with_state(
-            state.clone(),
-            common_headers::add_common_headers,
-        ))
+        .layer(from_fn(common_headers::add_common_headers))
+        .layer(conditional_layer(config.frontend.serve_html, || {
+            from_fn(svelte_redirect::redirect)
+        }))
         .layer(conditional_layer(env == Env::Development, || {
             from_fn(static_or_continue::serve_local_uploads)
         }))
-        .layer(conditional_layer(config.serve_dist, || {
-            from_fn(static_or_continue::serve_dist)
+        .layer(conditional_layer(config.frontend.serve_dist, || {
+            from_fn(static_or_continue::serve_svelte)
         }))
-        .layer(conditional_layer(config.serve_html, || {
-            from_fn_with_state(state.clone(), ember_html::serve_html)
+        .layer(conditional_layer(config.frontend.serve_html, || {
+            from_fn_with_state(state.clone(), frontend_html::serve)
         }))
         .layer(AddExtensionLayer::new(state.clone()));
 
     router
         .layer(middlewares_2)
         .layer(middlewares_1)
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
         .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(30)))
         .layer(CompressionLayer::new().quality(CompressionLevel::Fastest))
 }
 
-pub fn conditional_layer<L, F: FnOnce() -> L>(condition: bool, layer: F) -> Either<L, Identity> {
+pub fn conditional_layer<L, F: FnOnce() -> L>(
+    condition: bool,
+    layer: F,
+) -> Either<(ResponseAxumBodyLayer, L), Identity> {
     option_layer(condition.then(layer))
 }

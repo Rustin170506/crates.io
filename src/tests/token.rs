@@ -1,9 +1,10 @@
-use crate::tests::util::MockRequestExt;
-use crate::tests::{RequestHelper, TestApp};
-use crate::{models::ApiToken, views::EncodableMe};
+use crate::builders::PublishBuilder;
+use crate::util::MockTokenUser;
+use crate::{RequestHelper, TestApp};
+use claims::{assert_none, assert_ok, assert_some};
+use crates_io::{models::ApiToken, views::EncodableMe};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use http::{StatusCode, header};
 use insta::assert_snapshot;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -12,7 +13,8 @@ async fn using_token_updates_last_used_at() {
     let (app, anon, user, token) = TestApp::init().with_token().await;
     let mut conn = app.db_conn().await;
 
-    anon.get(url).await.assert_forbidden();
+    let response = anon.get::<()>(url).await;
+    assert_snapshot!(response.status(), @"403 Forbidden");
     user.get::<EncodableMe>(url).await.good();
     assert_none!(token.as_model().last_used_at);
 
@@ -34,12 +36,11 @@ async fn using_token_updates_last_used_at() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn old_tokens_give_specific_error_message() {
-    let url = "/api/v1/me";
-    let (_, anon) = TestApp::init().empty().await;
+    let (app, _anon) = TestApp::full().empty().await;
 
-    let mut request = anon.get_request(url);
-    request.header(header::AUTHORIZATION, "oldtoken");
-    let response = anon.run::<()>(request).await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let client = MockTokenUser::with_auth_header("oldtoken".to_string(), app.clone());
+    let pb = PublishBuilder::new("foo", "1.0.0");
+    let response = client.publish_crate(pb).await;
+    assert_snapshot!(response.status(), @"401 Unauthorized");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"The given API token does not match the format used by crates.io. Tokens generated before 2020-07-14 were generated with an insecure random number generator, and have been revoked. You can generate a new token at https://crates.io/me. For more information please see https://blog.rust-lang.org/2020/07/14/crates-io-security-advisory.html. We apologize for any inconvenience."}]}"#);
 }

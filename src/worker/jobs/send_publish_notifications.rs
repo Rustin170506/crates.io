@@ -1,5 +1,5 @@
-use crate::email::Email;
-use crate::models::OwnerKind;
+use crate::email::EmailMessage;
+use crate::models::{OwnerKind, TrustpubData};
 use crate::schema::{crate_owners, crates, emails, users, versions};
 use crate::worker::Environment;
 use anyhow::anyhow;
@@ -7,7 +7,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use minijinja::context;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// Background job that sends email notifications to all crate owners when a
 /// new crate version is published.
@@ -36,7 +39,11 @@ impl BackgroundJob for SendPublishNotificationsJob {
         let mut conn = ctx.deadpool.get().await?;
 
         // Get crate name, version and other publish details
-        let publish_details = PublishDetails::for_version(version_id, &mut conn).await?;
+        let Some(publish_details) = PublishDetails::for_version(version_id, &conn).await? else {
+            warn!("Skipping publish notifications for {version_id}: no version found");
+
+            return Ok(());
+        };
 
         let publish_time = publish_details
             .publish_time
@@ -71,30 +78,61 @@ impl BackgroundJob for SendPublishNotificationsJob {
             let krate = &publish_details.krate;
             let version = &publish_details.version;
 
-            let publisher_info = match &publish_details.publisher {
-                Some(publisher) if publisher == recipient => &format!(
+            let publisher_info = match (&publish_details.publisher, &publish_details.trustpub_data)
+            {
+                (Some(publisher), _) if publisher == recipient => &format!(
                     " by your account (https://{domain}/users/{publisher})",
                     domain = ctx.config.domain_name
                 ),
-                Some(publisher) => &format!(
+                (Some(publisher), _) => &format!(
                     " by {publisher} (https://{domain}/users/{publisher})",
                     domain = ctx.config.domain_name
                 ),
-                None => "",
+                (
+                    _,
+                    Some(TrustpubData::GitHub {
+                        repository, run_id, ..
+                    }),
+                ) => &format!(
+                    " by GitHub Actions (https://github.com/{repository}/actions/runs/{run_id})",
+                ),
+                (
+                    _,
+                    Some(TrustpubData::GitLab {
+                        project_path,
+                        job_id,
+                        ..
+                    }),
+                ) => {
+                    &format!(" by GitLab CI/CD (https://gitlab.com/{project_path}/-/jobs/{job_id})")
+                }
+                _ => "",
             };
 
-            let email = PublishNotificationEmail {
-                recipient,
-                krate,
-                version,
-                publish_time: &publish_time,
-                publisher_info,
-            };
+            let email = EmailMessage::from_template(
+                "publish_notification",
+                context! {
+                    recipient => recipient,
+                    krate => krate,
+                    version => version,
+                    publish_time => publish_time,
+                    publisher_info => publisher_info,
+                    domain => ctx.config.domain_name
+                },
+            );
 
             debug!("Sending publish notification for {krate}@{version} to {email_address}…");
-            let result = ctx.emails.send(&email_address, email).await.inspect_err(|err| {
-                warn!("Failed to send publish notification for {krate}@{version} to {email_address}: {err}")
-            });
+            let result = match email {
+                Ok(email_msg) => {
+                    ctx.emails.send(&email_address, email_msg).await.inspect_err(|err| {
+                        warn!("Failed to send publish notification for {krate}@{version} to {email_address}: {err}")
+                    }).map_err(|_| ())
+                }
+                Err(err) => {
+                    warn!("Failed to render publish notification email template for {krate}@{version} to {email_address}: {err}");
+                    Err(())
+                }
+            };
 
             results.push(result);
         }
@@ -128,7 +166,12 @@ impl BackgroundJob for SendPublishNotificationsJob {
     }
 }
 
-#[derive(Debug, Queryable, Selectable)]
+#[derive(Debug, HasQuery)]
+#[diesel(
+    base_query = versions::table
+        .inner_join(crates::table)
+        .left_join(users::table),
+)]
 struct PublishDetails {
     #[diesel(select_expression = crates::columns::id)]
     crate_id: i32,
@@ -140,52 +183,19 @@ struct PublishDetails {
     publish_time: DateTime<Utc>,
     #[diesel(select_expression = users::columns::gh_login.nullable())]
     publisher: Option<String>,
+    #[diesel(select_expression = versions::columns::trustpub_data.nullable())]
+    trustpub_data: Option<TrustpubData>,
 }
 
 impl PublishDetails {
-    async fn for_version(version_id: i32, conn: &mut AsyncPgConnection) -> QueryResult<Self> {
-        versions::table
-            .find(version_id)
-            .inner_join(crates::table)
-            .left_join(users::table)
-            .select(PublishDetails::as_select())
-            .first(conn)
+    async fn for_version(
+        version_id: i32,
+        mut conn: &AsyncPgConnection,
+    ) -> QueryResult<Option<Self>> {
+        PublishDetails::query()
+            .filter(versions::id.eq(version_id))
+            .first(&mut conn)
             .await
-    }
-}
-
-/// Email template for notifying crate owners about a new crate version
-/// being published.
-#[derive(Debug, Clone)]
-struct PublishNotificationEmail<'a> {
-    recipient: &'a str,
-    krate: &'a str,
-    version: &'a str,
-    publish_time: &'a str,
-    publisher_info: &'a str,
-}
-
-impl Email for PublishNotificationEmail<'_> {
-    fn subject(&self) -> String {
-        let Self { krate, version, .. } = self;
-        format!("crates.io: Successfully published {krate}@{version}")
-    }
-
-    fn body(&self) -> String {
-        let Self {
-            recipient,
-            krate,
-            version,
-            publish_time,
-            publisher_info,
-        } = self;
-
-        format!(
-            "Hello {recipient}!
-
-A new version of the package {krate} ({version}) was published{publisher_info} at {publish_time}.
-
-If you have questions or security concerns, you can contact us at help@crates.io. If you would like to stop receiving these security notifications, you can disable them in your account settings."
-        )
+            .optional()
     }
 }

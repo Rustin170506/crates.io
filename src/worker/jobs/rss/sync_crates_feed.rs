@@ -1,11 +1,14 @@
 use crate::schema::crates;
-use crate::storage::FeedId;
+use crate::storage::StorageKey;
 use crate::worker::Environment;
 use chrono::{Duration, Utc};
+use crates_io_database::models::CloudFrontDistribution;
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 #[derive(Serialize, Deserialize)]
 pub struct SyncCratesFeed;
@@ -28,15 +31,15 @@ impl BackgroundJob for SyncCratesFeed {
     type Context = Arc<Environment>;
 
     async fn run(&self, ctx: Self::Context) -> anyhow::Result<()> {
-        let feed_id = FeedId::Crates;
+        let key = StorageKey::CratesFeed;
         let domain = &ctx.config.domain_name;
 
         info!("Loading latest {NUM_ITEMS} crates from the database…");
-        let mut conn = ctx.deadpool.get().await?;
-        let new_crates = load_new_crates(&mut conn).await?;
+        let conn = ctx.deadpool.get().await?;
+        let new_crates = load_new_crates(&conn).await?;
 
         let link = rss::extension::atom::Link {
-            href: ctx.storage.feed_url(&feed_id),
+            href: ctx.storage.location(&key),
             rel: "self".to_string(),
             mime_type: Some("application/rss+xml".to_string()),
             ..Default::default()
@@ -61,11 +64,14 @@ impl BackgroundJob for SyncCratesFeed {
             ..Default::default()
         };
 
-        info!("Uploading feed to storage…");
-        ctx.storage.upload_feed(&feed_id, &channel).await?;
+        let path = key.path();
 
-        let path = object_store::path::Path::from(&feed_id);
-        if let Err(error) = ctx.invalidate_cdns(path.as_ref()).await {
+        info!("Uploading feed to storage…");
+        let bytes = super::serialize_channel(&channel)?;
+        ctx.storage.upload(&key, bytes.into()).await?;
+
+        let dist = CloudFrontDistribution::Static;
+        if let Err(error) = ctx.invalidate_cdns(&conn, dist, path.as_ref()).await {
             warn!("Failed to invalidate CDN caches: {error}");
         }
 
@@ -80,14 +86,13 @@ impl BackgroundJob for SyncCratesFeed {
 /// than [`ALWAYS_INCLUDE_AGE`]. If there are less than [`NUM_ITEMS`] crates
 /// then the list will be padded with older crates until [`NUM_ITEMS`] are
 /// returned.
-async fn load_new_crates(conn: &mut AsyncPgConnection) -> QueryResult<Vec<NewCrate>> {
+async fn load_new_crates(mut conn: &AsyncPgConnection) -> QueryResult<Vec<NewCrate>> {
     let threshold_dt = chrono::Utc::now().naive_utc() - ALWAYS_INCLUDE_AGE;
 
-    let new_crates = crates::table
+    let new_crates = NewCrate::query()
         .filter(crates::created_at.gt(threshold_dt))
         .order(crates::created_at.desc())
-        .select(NewCrate::as_select())
-        .load(conn)
+        .load(&mut conn)
         .await?;
 
     let num_new_crates = new_crates.len();
@@ -95,16 +100,15 @@ async fn load_new_crates(conn: &mut AsyncPgConnection) -> QueryResult<Vec<NewCra
         return Ok(new_crates);
     }
 
-    crates::table
+    NewCrate::query()
         .order(crates::created_at.desc())
-        .select(NewCrate::as_select())
         .limit(NUM_ITEMS)
-        .load(conn)
+        .load(&mut conn)
         .await
 }
 
-#[derive(Debug, Queryable, Selectable)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, HasQuery)]
+#[diesel(table_name = crates)]
 struct NewCrate {
     #[diesel(select_expression = crates::columns::name)]
     name: String,
@@ -152,6 +156,7 @@ impl NewCrate {
 mod tests {
     use super::*;
     use chrono::DateTime;
+    use claims::assert_ok;
     use crates_io_test_db::TestDatabase;
     use diesel_async::AsyncPgConnection;
     use futures_util::future::join_all;
@@ -164,23 +169,23 @@ mod tests {
         crate::util::tracing::init_for_test();
 
         let db = TestDatabase::new();
-        let mut conn = db.async_connect().await;
+        let conn = db.async_connect().await;
 
         let now = chrono::Utc::now();
 
-        let new_crates = assert_ok!(load_new_crates(&mut conn).await);
+        let new_crates = assert_ok!(load_new_crates(&conn).await);
         assert_eq!(new_crates.len(), 0);
 
         // If there are less than NUM_ITEMS crates, they should all be returned
         let futures = [
-            create_crate(&mut conn, "foo", now - Duration::days(123)),
-            create_crate(&mut conn, "bar", now - Duration::days(110)),
-            create_crate(&mut conn, "baz", now - Duration::days(100)),
-            create_crate(&mut conn, "qux", now - Duration::days(90)),
+            create_crate(&conn, "foo", now - Duration::days(123)),
+            create_crate(&conn, "bar", now - Duration::days(110)),
+            create_crate(&conn, "baz", now - Duration::days(100)),
+            create_crate(&conn, "qux", now - Duration::days(90)),
         ];
         join_all(futures).await;
 
-        let new_crates = assert_ok!(load_new_crates(&mut conn).await);
+        let new_crates = assert_ok!(load_new_crates(&conn).await);
         assert_eq!(new_crates.len(), 4);
         assert_debug_snapshot!(new_crates.iter().map(|u| &u.name).collect::<Vec<_>>());
 
@@ -189,11 +194,11 @@ mod tests {
         for i in 1..=NUM_ITEMS {
             let name = format!("crate-{i}");
             let publish_time = now - Duration::days(90) + Duration::hours(i);
-            futures.push(create_crate(&mut conn, name, publish_time));
+            futures.push(create_crate(&conn, name, publish_time));
         }
         join_all(futures).await;
 
-        let new_crates = assert_ok!(load_new_crates(&mut conn).await);
+        let new_crates = assert_ok!(load_new_crates(&conn).await);
         assert_eq!(new_crates.len() as i64, NUM_ITEMS);
         assert_debug_snapshot!(new_crates.iter().map(|u| &u.name).collect::<Vec<_>>());
 
@@ -202,20 +207,20 @@ mod tests {
         for i in 1..=(NUM_ITEMS + 10) {
             let name = format!("other-crate-{i}");
             let publish_time = now - Duration::minutes(30) + Duration::seconds(i);
-            futures.push(create_crate(&mut conn, name, publish_time));
+            futures.push(create_crate(&conn, name, publish_time));
         }
         join_all(futures).await;
 
-        let new_crates = assert_ok!(load_new_crates(&mut conn).await);
+        let new_crates = assert_ok!(load_new_crates(&conn).await);
         assert_eq!(new_crates.len() as i64, NUM_ITEMS + 10);
         assert_debug_snapshot!(new_crates.iter().map(|u| &u.name).collect::<Vec<_>>());
     }
 
     fn create_crate<T: Into<Cow<'static, str>>>(
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
         name: T,
         publish_time: DateTime<Utc>,
-    ) -> impl Future<Output = i32> + use<T> {
+    ) -> impl Future<Output = i32> + use<'_, T> {
         let future = diesel::insert_into(crates::table)
             .values((
                 crates::name.eq(name.into()),
@@ -223,7 +228,7 @@ mod tests {
                 crates::updated_at.eq(publish_time),
             ))
             .returning(crates::id)
-            .get_result(conn);
+            .get_result(&mut conn);
 
         async move { future.await.unwrap() }
     }

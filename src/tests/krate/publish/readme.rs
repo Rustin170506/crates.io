@@ -1,6 +1,5 @@
-use crate::tests::builders::{CrateBuilder, PublishBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
-use http::StatusCode;
+use crate::builders::{CrateBuilder, PublishBuilder};
+use crate::util::{RequestHelper, TestApp};
 use insta::{assert_json_snapshot, assert_snapshot};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9,14 +8,16 @@ async fn new_krate_with_readme() {
 
     let crate_to_publish = PublishBuilder::new("foo_readme", "1.0.0").readme("hello world");
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
     });
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/foo_readme/foo_readme-1.0.0.crate
+    crates/foo_readme/foo_readme-1.0.0.zip
+    crates/foo_readme/foo_readme-1.0.0.zip.json
     index/fo/o_/foo_readme
     readmes/foo_readme/foo_readme-1.0.0.html
     rss/crates.xml
@@ -31,14 +32,16 @@ async fn new_krate_with_empty_readme() {
 
     let crate_to_publish = PublishBuilder::new("foo_readme", "1.0.0").readme("");
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
     });
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/foo_readme/foo_readme-1.0.0.crate
+    crates/foo_readme/foo_readme-1.0.0.zip
+    crates/foo_readme/foo_readme-1.0.0.zip.json
     index/fo/o_/foo_readme
     rss/crates.xml
     rss/crates/foo_readme.xml
@@ -52,14 +55,16 @@ async fn new_krate_with_readme_and_plus_version() {
 
     let crate_to_publish = PublishBuilder::new("foo_readme", "1.0.0+foo").readme("hello world");
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
     });
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/foo_readme/foo_readme-1.0.0+foo.crate
+    crates/foo_readme/foo_readme-1.0.0+foo.zip
+    crates/foo_readme/foo_readme-1.0.0+foo.zip.json
     index/fo/o_/foo_readme
     readmes/foo_readme/foo_readme-1.0.0+foo.html
     rss/crates.xml

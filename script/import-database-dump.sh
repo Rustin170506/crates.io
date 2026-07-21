@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # Downloads the database dump tarball from crates.io and imports it
 # into the `cargo_registry` database. If the database already exists it
@@ -15,6 +15,10 @@ if [ -f "$TARBALL_PATH" ]; then
     echo "Skipping https://static.crates.io/db-dump.tar.gz download since it exists already "
 else
     echo "Downloading https://static.crates.io/db-dump.tar.gz to the 'tmp' folder"
+
+    # Ensure the directory exists.
+    mkdir -p "$(dirname "$TARBALL_PATH")"
+
     curl https://static.crates.io/db-dump.tar.gz -L --output $TARBALL_PATH
 fi
 
@@ -58,11 +62,16 @@ psql -a "$DATABASE_NAME" < schema.sql
 echo "Importing data"
 psql -a "$DATABASE_NAME" < import.sql
 
+cd "$ORIG_WD"
+
 # Importing the database doesn't cause materialised views to be refreshed, so
 # let's do that.
 psql --command="REFRESH MATERIALIZED VIEW recent_crate_downloads" "$DATABASE_NAME"
 
+# Reset all ID sequence values to match the imported data
+echo "Resetting sequence values"
+psql -a "$DATABASE_NAME" < "$(dirname "$0")/reset-sequences.sql"
+
 # Importing the database also doesn't insert Diesel migration metadata, but we
 # can infer that from the dump metadata and an up to date crates.io repo.
-cd "$ORIG_WD"
 python3 "$(dirname "$0")/infer-database-dump-version.py" -m "$DUMP_PATH/metadata.json" | psql -a "$DATABASE_NAME"

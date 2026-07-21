@@ -1,5 +1,6 @@
 pub mod authors;
 pub mod dependencies;
+pub mod docs;
 pub mod downloads;
 pub mod metadata;
 pub mod readme;
@@ -7,18 +8,21 @@ pub mod update;
 pub mod yank;
 
 use axum::extract::{FromRequestParts, Path};
-use diesel_async::AsyncPgConnection;
+use crates_io_database::fns::canon_crate_name;
+use crates_io_validation::validate_crate_name;
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use http::request::Parts;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 use utoipa::IntoParams;
 
-use crate::controllers::krate::load_crate;
 use crate::models::{Crate, Version};
-use crate::util::errors::{AppResult, version_not_found};
+use crate::schema::{crates, versions};
+use crate::util::errors::{AppResult, BoxedAppError, crate_not_found, custom, version_not_found};
 
-#[derive(Deserialize, FromRequestParts, IntoParams)]
+#[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
-#[from_request(via(Path))]
 pub struct CrateVersionPath {
     /// Name of the crate
     pub name: String,
@@ -28,31 +32,69 @@ pub struct CrateVersionPath {
     pub version: String,
 }
 
+impl<S: Send + Sync> FromRequestParts<S> for CrateVersionPath {
+    type Rejection = BoxedAppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(path) = Path::<CrateVersionPath>::from_request_parts(parts, state)
+            .await
+            .map_err(|err| custom(err.status(), err.body_text()))?;
+
+        // If the name is not a valid crate name it cannot exist in the
+        // database, so we skip the lookup and return a regular "not found"
+        // response. This also avoids passing invalid input (e.g. names
+        // containing null bytes) to the database layer, where PostgreSQL would
+        // reject the query with a confusing `invalid byte sequence for encoding
+        // "UTF8": 0x00` error and cause a 500 response. (The version is already
+        // validated as valid semver during deserialization.)
+        if validate_crate_name("crate", &path.name).is_err() {
+            return Err(crate_not_found(&path.name));
+        }
+
+        Ok(path)
+    }
+}
+
 impl CrateVersionPath {
-    pub async fn load_version(&self, conn: &mut AsyncPgConnection) -> AppResult<Version> {
-        Ok(self.load_version_and_crate(conn).await?.0)
+    pub async fn load_version(&self, mut conn: &AsyncPgConnection) -> AppResult<Version> {
+        let row = Self::base_query(&self.name, &self.version)
+            .select((crates::id, Option::<Version>::as_select()))
+            .first::<(i32, _)>(&mut conn)
+            .await
+            .optional()?;
+
+        self.gather(row).map(|r| r.0)
     }
 
     pub async fn load_version_and_crate(
         &self,
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
     ) -> AppResult<(Version, Crate)> {
-        version_and_crate(conn, &self.name, &self.version).await
+        let row = Self::base_query(&self.name, &self.version)
+            .select(<(Crate, Option<Version>)>::as_select())
+            .first(&mut conn)
+            .await
+            .optional()?;
+
+        self.gather(row)
     }
-}
 
-async fn version_and_crate(
-    conn: &mut AsyncPgConnection,
-    crate_name: &str,
-    semver: &str,
-) -> AppResult<(Version, Crate)> {
-    let krate = load_crate(conn, crate_name).await?;
-    let version = krate
-        .find_version(conn, semver)
-        .await?
-        .ok_or_else(|| version_not_found(crate_name, semver))?;
+    #[diesel::dsl::auto_type(no_type_alias)]
+    fn base_query<'a>(crate_name: &'a str, semver: &'a str) -> _ {
+        crates::table
+            .left_join(
+                versions::table.on(crates::id
+                    .eq(versions::crate_id)
+                    .and(versions::num.eq(semver))),
+            )
+            .filter(canon_crate_name(crates::name).eq(canon_crate_name(crate_name)))
+    }
 
-    Ok((version, krate))
+    fn gather<C, V>(&self, row: Option<(C, Option<V>)>) -> AppResult<(V, C)> {
+        let (krate_or_id, version) = row.ok_or_else(|| crate_not_found(&self.name))?;
+        let version = version.ok_or_else(|| version_not_found(&self.name, &self.version))?;
+        Ok((version, krate_or_id))
+    }
 }
 
 fn deserialize_version<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {

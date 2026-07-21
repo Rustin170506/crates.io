@@ -1,12 +1,10 @@
 use crate::models::{ApiToken, User, Version};
+use crate::pg_enum;
 use crate::schema::*;
 use bon::Builder;
 use chrono::{DateTime, Utc};
-use crates_io_diesel_helpers::pg_enum;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use futures_util::future::BoxFuture;
-use futures_util::future::FutureExt;
 
 pg_enum! {
     pub enum VersionAction {
@@ -34,10 +32,9 @@ impl From<VersionAction> for String {
     }
 }
 
-#[derive(Debug, Clone, Copy, Queryable, Identifiable, Associations)]
+#[derive(Debug, Clone, Copy, HasQuery, Identifiable, Associations)]
 #[diesel(
     table_name = version_owner_actions,
-    check_for_backend(diesel::pg::Pg),
     belongs_to(Version),
     belongs_to(User, foreign_key = user_id),
     belongs_to(ApiToken, foreign_key = api_token_id),
@@ -53,32 +50,34 @@ pub struct VersionOwnerAction {
 }
 
 impl VersionOwnerAction {
-    pub async fn all(conn: &mut AsyncPgConnection) -> QueryResult<Vec<Self>> {
-        version_owner_actions::table.load(conn).await
+    pub async fn all(mut conn: &AsyncPgConnection) -> QueryResult<Vec<Self>> {
+        Self::query().load(&mut conn).await
     }
 
-    pub fn by_version<'a>(
-        conn: &mut AsyncPgConnection,
-        version: &'a Version,
-    ) -> BoxFuture<'a, QueryResult<Vec<(Self, User)>>> {
+    pub async fn by_version(
+        mut conn: &AsyncPgConnection,
+        version: &Version,
+    ) -> QueryResult<Vec<(Self, User)>> {
         use version_owner_actions::dsl::version_id;
 
         version_owner_actions::table
             .filter(version_id.eq(version.id))
-            .inner_join(users::table)
+            .inner_join(users::table.left_join(oauth_github::table))
+            .select((VersionOwnerAction::as_select(), User::as_select()))
             .order(version_owner_actions::dsl::id)
-            .load(conn)
-            .boxed()
+            .load(&mut conn)
+            .await
     }
 
     pub async fn for_versions(
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
         versions: &[&Version],
     ) -> QueryResult<Vec<Vec<(Self, User)>>> {
         Ok(Self::belonging_to(versions)
-            .inner_join(users::table)
+            .inner_join(users::table.left_join(oauth_github::table))
+            .select((VersionOwnerAction::as_select(), User::as_select()))
             .order(version_owner_actions::dsl::id)
-            .load(conn)
+            .load(&mut conn)
             .await?
             .grouped_by(versions))
     }
@@ -95,10 +94,11 @@ pub struct NewVersionOwnerAction {
 }
 
 impl NewVersionOwnerAction {
-    pub async fn insert(&self, conn: &mut AsyncPgConnection) -> QueryResult<VersionOwnerAction> {
+    pub async fn insert(&self, mut conn: &AsyncPgConnection) -> QueryResult<VersionOwnerAction> {
         diesel::insert_into(version_owner_actions::table)
             .values(self)
-            .get_result(conn)
+            .returning(VersionOwnerAction::as_select())
+            .get_result(&mut conn)
             .await
     }
 }

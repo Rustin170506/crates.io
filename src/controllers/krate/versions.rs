@@ -6,21 +6,23 @@ use crate::controllers::helpers::pagination::{
 };
 use crate::controllers::krate::CratePath;
 use crate::models::{User, Version, VersionOwnerAction};
-use crate::schema::{users, versions};
+use crate::schema::{oauth_github, users, versions};
 use crate::util::RequestUtils;
 use crate::util::errors::{AppResult, BoxedAppError, bad_request};
 use crate::util::string_excl_null::StringExclNull;
 use crate::views::EncodableVersion;
+use crate::views::release_tracks::{ReleaseTrackDetails, ReleaseTracks};
 use axum::Json;
 use axum::extract::FromRequestParts;
 use axum_extra::extract::Query;
-use crates_io_diesel_helpers::semver_ord;
+use crates_io_database::fns::semver_ord_v2;
 use diesel::dsl::not;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use futures_util::{TryStreamExt, future};
 use http::request::Parts;
 use indexmap::{IndexMap, IndexSet};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 #[derive(Debug, Deserialize, FromRequestParts, utoipa::IntoParams)]
@@ -84,9 +86,9 @@ pub async fn list_versions(
     pagination: PaginationQueryParams,
     req: Parts,
 ) -> AppResult<Json<ListResponse>> {
-    let mut conn = state.db_read().await?;
+    let conn = state.db_read().await?;
 
-    let crate_id = path.load_crate_id(&mut conn).await?;
+    let crate_id = path.load_crate_id(&conn).await?;
 
     // To keep backward compatibility, we paginate only if per_page is provided
     let pagination = match pagination.per_page {
@@ -99,15 +101,14 @@ pub async fn list_versions(
         None => None,
     };
 
-    let versions_and_publishers =
-        list(crate_id, pagination.as_ref(), &params, &req, &mut conn).await?;
+    let versions_and_publishers = list(crate_id, pagination.as_ref(), &params, &req, &conn).await?;
 
     let versions = versions_and_publishers
         .data
         .iter()
         .map(|(v, _)| v)
         .collect::<Vec<_>>();
-    let actions = VersionOwnerAction::for_versions(&mut conn, &versions).await?;
+    let actions = VersionOwnerAction::for_versions(&conn, &versions).await?;
     let versions = versions_and_publishers
         .data
         .into_iter()
@@ -131,7 +132,7 @@ async fn list(
     options: Option<&PaginationOptions>,
     params: &ListQueryParams,
     req: &Parts,
-    conn: &mut AsyncPgConnection,
+    mut conn: &AsyncPgConnection,
 ) -> AppResult<PaginatedVersionsAndPublishers> {
     use seek::*;
 
@@ -143,7 +144,7 @@ async fn list(
     let make_base_query = || {
         let mut query = versions::table
             .filter(versions::crate_id.eq(crate_id))
-            .left_outer_join(users::table)
+            .left_outer_join(users::table.left_join(oauth_github::table))
             .select(<(Version, Option<User>)>::as_select())
             .into_boxed();
 
@@ -172,10 +173,11 @@ async fn list(
             }
             Some(SeekPayload::Semver(Semver { num, id })) => {
                 query = query.filter(
-                    versions::semver_ord
-                        .eq(semver_ord(num.clone()))
+                    versions::semver_ord_v2
+                        .nullable()
+                        .eq(semver_ord_v2(num.clone()))
                         .and(versions::id.lt(id))
-                        .or(versions::semver_ord.lt(semver_ord(num))),
+                        .or(versions::semver_ord_v2.nullable().lt(semver_ord_v2(num))),
                 )
             }
             None => {}
@@ -187,10 +189,10 @@ async fn list(
     if seek == Seek::Date {
         query = query.order((versions::created_at.desc(), versions::id.desc()));
     } else {
-        query = query.order((versions::semver_ord.desc(), versions::id.desc()));
+        query = query.order((versions::semver_ord_v2.desc(), versions::id.desc()));
     }
 
-    let data: Vec<(Version, Option<User>)> = query.load(conn).await?;
+    let data: Vec<(Version, Option<User>)> = query.load(&mut conn).await?;
     let mut next_page = None;
     if let Some(options) = options {
         next_page = next_seek_params(&data, options, |last| seek.to_payload(last))?
@@ -204,8 +206,8 @@ async fn list(
                 .filter(versions::crate_id.eq(crate_id))
                 .filter(not(versions::yanked))
                 .select(versions::num)
-                .order(versions::semver_ord.desc())
-                .load_stream::<String>(conn)
+                .order(versions::semver_ord_v2.desc())
+                .load_stream::<String>(&mut conn)
                 .await?
                 .try_for_each(|num| {
                     if let Ok(semver) = semver::Version::parse(&num) {
@@ -238,7 +240,7 @@ async fn list(
     // Since the total count is retrieved through an additional query, to maintain consistency
     // with other pagination methods, we only make a count query while data is not empty.
     let total = if !data.is_empty() {
-        make_base_query().count().get_result(conn).await?
+        make_base_query().count().get_result(&mut conn).await?
     } else {
         0
     };
@@ -332,76 +334,8 @@ struct ResponseMeta {
     /// Additional data about the crate's release tracks,
     /// if `?include=release_tracks` is used.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<Object>)]
+    #[schema(value_type = Option<std::collections::HashMap<String, ReleaseTrackDetails>>)]
     release_tracks: Option<ReleaseTracks>,
-}
-
-#[derive(Debug, Eq, PartialEq, Serialize)]
-struct ReleaseTracks(IndexMap<ReleaseTrackName, ReleaseTrackDetails>);
-
-impl ReleaseTracks {
-    // Return the release tracks based on a sorted semver versions iterator (in descending order).
-    // **Remember to** filter out yanked versions manually before calling this function.
-    pub fn from_sorted_semver_iter<'a, I>(versions: I) -> Self
-    where
-        I: Iterator<Item = &'a semver::Version>,
-    {
-        let mut map = IndexMap::new();
-        for num in versions.filter(|num| num.pre.is_empty()) {
-            let key = ReleaseTrackName::from_semver(num);
-            let prev = map.last();
-            if prev.filter(|&(k, _)| *k == key).is_none() {
-                map.insert(
-                    key,
-                    ReleaseTrackDetails {
-                        highest: num.clone(),
-                    },
-                );
-            }
-        }
-
-        Self(map)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum ReleaseTrackName {
-    Minor(u64),
-    Major(u64),
-}
-
-impl ReleaseTrackName {
-    pub fn from_semver(version: &semver::Version) -> Self {
-        if version.major == 0 {
-            Self::Minor(version.minor)
-        } else {
-            Self::Major(version.major)
-        }
-    }
-}
-
-impl std::fmt::Display for ReleaseTrackName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Minor(minor) => write!(f, "0.{minor}"),
-            Self::Major(major) => write!(f, "{major}"),
-        }
-    }
-}
-
-impl serde::Serialize for ReleaseTrackName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-        Self: std::fmt::Display,
-    {
-        serializer.collect_str(self)
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-struct ReleaseTrackDetails {
-    highest: semver::Version,
 }
 
 #[derive(Debug, Default)]
@@ -429,112 +363,5 @@ impl FromStr for ShowIncludeMode {
             }
         }
         Ok(mode)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ReleaseTrackDetails, ReleaseTrackName, ReleaseTracks};
-    use indexmap::IndexMap;
-    use serde_json::json;
-
-    #[track_caller]
-    fn version(str: &str) -> semver::Version {
-        semver::Version::parse(str).unwrap()
-    }
-
-    #[test]
-    fn release_tracks_empty() {
-        let versions = [];
-        assert_eq!(
-            ReleaseTracks::from_sorted_semver_iter(versions.into_iter()),
-            ReleaseTracks(IndexMap::new())
-        );
-    }
-
-    #[test]
-    fn release_tracks_prerelease() {
-        let versions = [version("1.0.0-beta.5")];
-        assert_eq!(
-            ReleaseTracks::from_sorted_semver_iter(versions.iter()),
-            ReleaseTracks(IndexMap::new())
-        );
-    }
-
-    #[test]
-    fn release_tracks_multiple() {
-        let versions = [
-            "100.1.1",
-            "100.1.0",
-            "1.3.5",
-            "1.2.5",
-            "1.1.5",
-            "0.4.0-rc.1",
-            "0.3.23",
-            "0.3.22",
-            "0.3.21-pre.0",
-            "0.3.20",
-            "0.3.3",
-            "0.3.2",
-            "0.3.1",
-            "0.3.0",
-            "0.2.1",
-            "0.2.0",
-            "0.1.2",
-            "0.1.1",
-        ]
-        .map(version);
-
-        let release_tracks = ReleaseTracks::from_sorted_semver_iter(versions.iter());
-        assert_eq!(
-            release_tracks,
-            ReleaseTracks(IndexMap::from([
-                (
-                    ReleaseTrackName::Major(100),
-                    ReleaseTrackDetails {
-                        highest: version("100.1.1")
-                    }
-                ),
-                (
-                    ReleaseTrackName::Major(1),
-                    ReleaseTrackDetails {
-                        highest: version("1.3.5")
-                    }
-                ),
-                (
-                    ReleaseTrackName::Minor(3),
-                    ReleaseTrackDetails {
-                        highest: version("0.3.23")
-                    }
-                ),
-                (
-                    ReleaseTrackName::Minor(2),
-                    ReleaseTrackDetails {
-                        highest: version("0.2.1")
-                    }
-                ),
-                (
-                    ReleaseTrackName::Minor(1),
-                    ReleaseTrackDetails {
-                        highest: version("0.1.2")
-                    }
-                ),
-            ]))
-        );
-
-        let json = serde_json::from_str::<serde_json::Value>(
-            &serde_json::to_string(&release_tracks).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            json,
-            json!({
-                "100": { "highest": "100.1.1" },
-                "1": { "highest": "1.3.5" },
-                "0.3": { "highest": "0.3.23" },
-                "0.2": { "highest": "0.2.1" },
-                "0.1": { "highest": "0.1.2" }
-            })
-        );
     }
 }

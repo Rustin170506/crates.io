@@ -1,14 +1,14 @@
 use anyhow::anyhow;
 use clap::Parser;
-use crates_io_tarball::process_tarball;
-use futures_util::{stream, StreamExt};
+use crates_io_tarball::{TarballLimits, process_tarball};
+use futures_util::{StreamExt, stream};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator, ProgressStyle};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tracing::{debug, info, warn};
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use walkdir::WalkDir;
 
 /// Runs through all crate files in a folder and shows parsing errors.
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 async fn process_path(path: &Path, pb: &ProgressBar) {
     let file = File::open(path)
         .await
-        .map_err(|error| pb.suspend(|| warn!(%error, "Failed to read crate file")));
+        .map_err(|error| pb.suspend(|| warn!("Failed to read crate file: {error}")));
 
     let Ok(mut file) = file else {
         return;
@@ -78,10 +78,16 @@ async fn process_path(path: &Path, pb: &ProgressBar) {
     let pkg_name = path_no_ext.file_name().unwrap().to_string_lossy();
     pb.set_message(format!("{pkg_name}"));
 
-    let result = process_tarball(&pkg_name, &mut file, u64::MAX).await;
+    let limits = TarballLimits {
+        unpack_size: u64::MAX,
+        entries: None,
+    };
+    let result = process_tarball(&pkg_name, &mut file, limits).await;
     pb.suspend(|| match result {
         Ok(result) => debug!(%pkg_name, path = %path.display(), ?result),
-        Err(error) => warn!(%pkg_name, path = %path.display(), %error, "Failed to process tarball"),
+        Err(error) => {
+            warn!(%pkg_name, path = %path.display(), "Failed to process tarball: {error}")
+        }
     })
 }
 

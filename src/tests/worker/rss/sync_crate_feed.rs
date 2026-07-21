@@ -1,11 +1,12 @@
-use crate::schema::{crates, versions};
-use crate::tests::util::TestApp;
-use crate::worker::jobs;
+use crate::util::TestApp;
 use chrono::DateTime;
+use crates_io::schema::{crates, versions};
+use crates_io::worker::jobs;
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use insta::assert_snapshot;
+use object_store::ObjectStoreExt;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sync_crate_feed() -> anyhow::Result<()> {
@@ -20,7 +21,7 @@ async fn test_sync_crate_feed() -> anyhow::Result<()> {
     create_version(&mut conn, "foo", "1.2.0", "2024-06-22T15:57:19Z").await?;
 
     let job = jobs::rss::SyncCrateFeed::new("foo".to_string());
-    job.enqueue(&mut conn).await?;
+    job.enqueue(&conn).await?;
 
     app.run_pending_background_jobs().await;
 
@@ -72,7 +73,7 @@ async fn create_version(
             versions::num_no_build.eq(version),
             versions::created_at.eq(publish_time),
             versions::updated_at.eq(publish_time),
-            versions::checksum.eq("checksum"),
+            versions::tar_sha256.eq(vec![0u8; 32]),
             versions::crate_size.eq(0),
         ))
         .returning(versions::id)

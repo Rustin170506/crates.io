@@ -1,10 +1,9 @@
-import { defer } from '@/e2e/deferred';
 import { expect, test } from '@/e2e/helper';
 import { http, HttpResponse } from 'msw';
 
 test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
   async function prepare(msw) {
-    let user = msw.db.user.create({
+    let user = await msw.db.user.create({
       login: 'johnnydee',
       name: 'John Doe',
       email: 'john@doe.com',
@@ -44,12 +43,16 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
     await page.click('[data-test-scope="publish-update"]');
     await page.click('[data-test-generate]');
 
-    let token = msw.db.apiToken.findFirst({ where: { name: { equals: 'token-name' } } });
-    expect(token, 'API token has been created in the backend database').toBeTruthy();
-    expect(token.name).toBe('token-name');
-    expect(token.expiredAt).toBe(null);
-    expect(token.crateScopes).toBe(null);
-    expect(token.endpointScopes).toEqual(['publish-update']);
+    await expect
+      .poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' })))
+      .toMatchObject({
+        name: 'token-name',
+        expiredAt: null,
+        crateScopes: null,
+        endpointScopes: ['publish-update'],
+      });
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' }));
 
     await expect(page).toHaveURL('/settings/tokens');
     await expect(page.locator('[data-test-api-token="1"] [data-test-name]')).toHaveText('token-name');
@@ -133,11 +136,15 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
 
     await page.click('[data-test-generate]');
 
-    let token = msw.db.apiToken.findFirst({ where: { name: { equals: 'token-name' } } });
-    expect(token, 'API token has been created in the backend database').toBeTruthy();
-    expect(token.name).toBe('token-name');
-    expect(token.crateScopes).toEqual(['serde-*', 'serde']);
-    expect(token.endpointScopes).toEqual(['publish-update', 'yank']);
+    await expect
+      .poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' })))
+      .toMatchObject({
+        name: 'token-name',
+        crateScopes: ['serde-*', 'serde'],
+        endpointScopes: ['publish-update', 'yank'],
+      });
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' }));
 
     await expect(page).toHaveURL('/settings/tokens');
     await expect(page.locator('[data-test-api-token="1"] [data-test-name]')).toHaveText('token-name');
@@ -172,12 +179,16 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
     await page.click('[data-test-scope="publish-update"]');
     await page.click('[data-test-generate]');
 
-    let token = msw.db.apiToken.findFirst({ where: { name: { equals: 'token-name' } } });
-    expect(token, 'API token has been created in the backend database').toBeTruthy();
-    expect(token.name).toBe('token-name');
-    expect(token.expiredAt.slice(0, 10)).toBe('2017-12-20');
-    expect(token.crateScopes).toBe(null);
-    expect(token.endpointScopes).toEqual(['publish-update']);
+    await expect
+      .poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' })))
+      .toMatchObject({
+        name: 'token-name',
+        expiredAt: expect.stringMatching(/^2017-12-20/),
+        crateScopes: null,
+        endpointScopes: ['publish-update'],
+      });
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' }));
 
     await expect(page).toHaveURL('/settings/tokens');
     await expect(page.locator('[data-test-api-token="1"] [data-test-name]')).toHaveText('token-name');
@@ -212,12 +223,16 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
 
     await page.click('[data-test-generate]');
 
-    let token = msw.db.apiToken.findFirst({ where: { name: { equals: 'token-name' } } });
-    expect(token, 'API token has been created in the backend database').toBeTruthy();
-    expect(token.name).toBe('token-name');
-    expect(token.expiredAt.slice(0, 10)).toBe('2024-05-04');
-    expect(token.crateScopes).toBe(null);
-    expect(token.endpointScopes).toEqual(['publish-update']);
+    await expect
+      .poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' })))
+      .toMatchObject({
+        name: 'token-name',
+        expiredAt: expect.stringMatching(/^2024-05-04/),
+        crateScopes: null,
+        endpointScopes: ['publish-update'],
+      });
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'token-name' }));
 
     await expect(page).toHaveURL('/settings/tokens');
     await expect(page.locator('[data-test-api-token="1"] [data-test-name]')).toHaveText('token-name');
@@ -234,7 +249,7 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
   test('loading and error state', async ({ page, msw }) => {
     await prepare(msw);
 
-    let deferred = defer();
+    let deferred = Promise.withResolvers<Response>();
     msw.worker.use(http.put('/api/v1/me/tokens', () => deferred.promise));
 
     await page.goto('/settings/tokens/new');
@@ -295,7 +310,7 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
   test('prefill with the exist token', async ({ page, msw }) => {
     let { user } = await prepare(msw);
 
-    msw.db.apiToken.create({
+    await msw.db.apiToken.create({
       user: user,
       id: 1,
       name: 'foo',
@@ -320,8 +335,7 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
     );
     await page.click('[data-test-generate]');
 
-    let newToken = msw.db.apiToken.findFirst({ where: { name: { equals: 'foo' } } });
-    expect(newToken, 'New API token has been created in the backend database').toBeTruthy();
+    await expect.poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'foo' }))).toBeTruthy();
 
     await expect(page).toHaveURL('/settings/tokens');
     await page.click('[data-test-new-token-button]');
@@ -336,9 +350,39 @@ test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
     await expect(page).toHaveURL('/settings/tokens/new?from=1');
     await expect(page.locator('[data-test-title]')).toHaveText('Token not found');
   });
-});
 
-test.describe('/settings/tokens/new', { tag: '@routes' }, () => {
+  test('trusted-publishing scope', async ({ page, msw }) => {
+    await prepare(msw);
+
+    await page.goto('/settings/tokens/new');
+    await expect(page).toHaveURL('/settings/tokens/new');
+
+    await page.fill('[data-test-name]', 'trusted-publishing-token');
+    await page.locator('[data-test-expiry]').selectOption('none');
+    await page.click('[data-test-scope="trusted-publishing"]');
+    await page.click('[data-test-generate]');
+
+    await expect
+      .poll(() => msw.db.apiToken.findFirst(q => q.where({ name: 'trusted-publishing-token' })))
+      .toMatchObject({
+        name: 'trusted-publishing-token',
+        expiredAt: null,
+        crateScopes: null,
+        endpointScopes: ['trusted-publishing'],
+      });
+
+    let token = msw.db.apiToken.findFirst(q => q.where({ name: 'trusted-publishing-token' }));
+
+    await expect(page).toHaveURL('/settings/tokens');
+    await expect(page.locator('[data-test-api-token="1"] [data-test-name]')).toHaveText('trusted-publishing-token');
+    await expect(page.locator('[data-test-api-token="1"] [data-test-token]')).toHaveText(token.token);
+    await expect(page.locator('[data-test-api-token="1"] [data-test-endpoint-scopes]')).toHaveText(
+      'Scopes: trusted-publishing',
+    );
+    await expect(page.locator('[data-test-api-token="1"] [data-test-crate-scopes]')).toHaveCount(0);
+    await expect(page.locator('[data-test-api-token="1"] [data-test-expired-at]')).toHaveCount(0);
+  });
+
   test('access is blocked if unauthenticated', async ({ page }) => {
     await page.goto('/settings/tokens/new');
     await expect(page).toHaveURL('/settings/tokens/new');

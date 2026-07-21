@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::Path;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GetResponse {
@@ -23,10 +24,13 @@ pub struct GetResponse {
     responses((status = 200, description = "Successful Response", body = inline(GetResponse))),
 )]
 pub async fn find_team(state: AppState, Path(name): Path<String>) -> AppResult<Json<GetResponse>> {
-    use crate::schema::teams::dsl::{login, teams};
+    use crate::schema::teams::dsl::login;
 
     let mut conn = state.db_read().await?;
-    let team: Team = teams.filter(login.eq(&name)).first(&mut conn).await?;
+    let team: Team = Team::query()
+        .filter(login.eq(&name))
+        .first(&mut conn)
+        .await?;
     let team = EncodableTeam::from(team);
     Ok(Json(GetResponse { team }))
 }

@@ -1,17 +1,16 @@
-use crate::models::Category;
-use crate::schema::crates;
-use crate::tests::builders::{CrateBuilder, VersionBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
-use crate::tests::{new_category, new_user};
+use crate::builders::{CrateBuilder, VersionBuilder};
+use crate::util::{RequestHelper, TestApp};
+use crate::{new_category, new_user};
+use crates_io::models::Category;
+use crates_io::schema::{crates, version_downloads, versions};
 use crates_io_database::schema::categories;
 use diesel::sql_types::Timestamptz;
 use diesel::{dsl::*, prelude::*, update};
 use diesel_async::RunQueryDsl;
 use googletest::prelude::*;
 use http::StatusCode;
-use insta::{assert_json_snapshot, assert_snapshot};
-use regex::Regex;
-use std::sync::LazyLock;
+use insta::{assert_debug_snapshot, assert_json_snapshot, assert_snapshot};
+use regex::regex;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn index() -> anyhow::Result<()> {
@@ -23,7 +22,7 @@ async fn index() -> anyhow::Result<()> {
         assert_eq!(json.meta.total, 0);
     }
 
-    let user_id = new_user("foo").insert(&mut conn).await?.id;
+    let user_id = new_user("foo").insert(&conn).await?;
 
     let krate = CrateBuilder::new("fooindex", user_id)
         .expect_build(&mut conn)
@@ -279,6 +278,179 @@ async fn exact_match_first_on_queries() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Inserts `count` crates that all match a search for `widget` (via their
+/// description). Each crate gets a distinct recent-download count equal to its
+/// index, so the most-downloaded candidates are unambiguous. Names are
+/// zero-padded so that lexical and numeric order match.
+async fn insert_popular_widget_matches(conn: &mut diesel_async::AsyncPgConnection, count: i64) {
+    let new_crates = (1..=count)
+        .map(|i| {
+            (
+                crates::name.eq(format!("filler_widget_{i:04}")),
+                crates::description.eq("widget"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let crate_ids: Vec<i32> = insert_into(crates::table)
+        .values(new_crates)
+        .returning(crates::id)
+        .get_results(conn)
+        .await
+        .unwrap();
+
+    let new_versions = crate_ids
+        .iter()
+        .map(|&crate_id| {
+            (
+                versions::crate_id.eq(crate_id),
+                versions::num.eq("1.0.0"),
+                versions::num_no_build.eq("1.0.0"),
+                versions::crate_size.eq(0),
+                versions::tar_sha256.eq(vec![0u8; 32]),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let version_ids: Vec<i32> = insert_into(versions::table)
+        .values(new_versions)
+        .returning(versions::id)
+        .get_results(conn)
+        .await
+        .unwrap();
+
+    let new_downloads = version_ids
+        .iter()
+        .zip(1..=count)
+        .map(|(&version_id, i)| {
+            (
+                version_downloads::version_id.eq(version_id),
+                version_downloads::downloads.eq(i as i32),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    insert_into(version_downloads::table)
+        .values(new_downloads)
+        .execute(conn)
+        .await
+        .unwrap();
+
+    diesel::sql_query("REFRESH MATERIALIZED VIEW recent_crate_downloads")
+        .execute(conn)
+        .await
+        .unwrap();
+}
+
+/// A more textually relevant crate that is not among the most-downloaded
+/// matches is excluded from relevance results, since ranking is bounded to the
+/// most-downloaded candidates.
+#[tokio::test(flavor = "multi_thread")]
+async fn relevance_search_is_bounded_to_most_downloaded_candidates() -> anyhow::Result<()> {
+    // More matches than RELEVANCE_CANDIDATE_LIMIT (1000), so the least
+    // downloaded matches fall outside the candidate set.
+    const POPULAR_MATCH_COUNT: i64 = 1111;
+
+    let (app, anon, user) = TestApp::init().with_user().await;
+    let mut conn = app.db_conn().await;
+    let user = user.as_model();
+
+    insert_popular_widget_matches(&mut conn, POPULAR_MATCH_COUNT).await;
+
+    // Higher text relevance, but no recent downloads, so it falls outside the
+    // candidate set.
+    CrateBuilder::new("relevant_widget", user.id)
+        .description("widget widget widget")
+        .recent_downloads(0)
+        .expect_build(&mut conn)
+        .await;
+
+    let json = anon.search("q=widget").await;
+    assert_eq!(json.meta.total as i64, POPULAR_MATCH_COUNT + 1);
+    let crate_names = json.crates.into_iter().map(|c| c.name).collect::<Vec<_>>();
+    assert_debug_snapshot!(crate_names, @r#"
+    [
+        "filler_widget_1111",
+        "filler_widget_1110",
+        "filler_widget_1109",
+        "filler_widget_1108",
+        "filler_widget_1107",
+        "filler_widget_1106",
+        "filler_widget_1105",
+        "filler_widget_1104",
+        "filler_widget_1103",
+        "filler_widget_1102",
+    ]
+    "#);
+
+    Ok(())
+}
+
+/// An exact name match is always ranked, and ranked first, even with no
+/// downloads and many more popular matches.
+#[tokio::test(flavor = "multi_thread")]
+async fn relevance_search_always_includes_exact_name_match() -> anyhow::Result<()> {
+    const POPULAR_MATCH_COUNT: i64 = 1111;
+
+    let (app, anon, user) = TestApp::init().with_user().await;
+    let mut conn = app.db_conn().await;
+    let user = user.as_model();
+
+    insert_popular_widget_matches(&mut conn, POPULAR_MATCH_COUNT).await;
+
+    // Exact name match, but without any recent downloads.
+    CrateBuilder::new("widget", user.id)
+        .recent_downloads(0)
+        .expect_build(&mut conn)
+        .await;
+
+    let json = anon.search("q=widget").await;
+    assert_eq!(json.meta.total as i64, POPULAR_MATCH_COUNT + 1);
+    let crate_names = json.crates.into_iter().map(|c| c.name).collect::<Vec<_>>();
+    assert_debug_snapshot!(crate_names, @r#"
+    [
+        "widget",
+        "filler_widget_1111",
+        "filler_widget_1110",
+        "filler_widget_1109",
+        "filler_widget_1108",
+        "filler_widget_1107",
+        "filler_widget_1106",
+        "filler_widget_1105",
+        "filler_widget_1104",
+        "filler_widget_1103",
+    ]
+    "#);
+
+    Ok(())
+}
+
+/// Requesting an explicit page beyond the bounded candidate set returns an
+/// error instead of a silently empty page. Seek pagination has no equivalent
+/// guard because it stops handing out keys once it reaches the boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn relevance_search_rejects_paging_beyond_candidate_limit() -> anyhow::Result<()> {
+    const POPULAR_MATCH_COUNT: i64 = 1111;
+
+    let (app, anon, _user) = TestApp::init().with_user().await;
+    let mut conn = app.db_conn().await;
+
+    insert_popular_widget_matches(&mut conn, POPULAR_MATCH_COUNT).await;
+
+    // The last page within the candidate limit still succeeds.
+    let json = anon.search("q=widget&per_page=100&page=10").await;
+    assert_eq!(json.crates.len(), 100);
+
+    // The next page would start beyond the candidate limit and is rejected.
+    let response = anon
+        .get_with_query::<()>("/api/v1/crates", "q=widget&per_page=100&page=11")
+        .await;
+    assert_snapshot!(response.status(), @"400 Bad Request");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Cannot page beyond the first 1000 results when sorting by relevance. Please take a look at https://crates.io/data-access for alternatives."}]}"#);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::cognitive_complexity)]
 async fn index_sorting() -> anyhow::Result<()> {
@@ -432,15 +604,15 @@ async fn index_sorting() -> anyhow::Result<()> {
     assert_eq!(calls, 5);
 
     // Sort by relevance
-    // ordering (exact match desc, rank desc, name asc)
+    // ordering (exact match desc, rank desc, recent downloads desc nulls last, name asc)
     let query = "q=foo_sort";
     let (resp, calls) = page_with_seek(&anon, query).await;
     for json in search_both(&anon, query).await {
         assert_eq!(json.meta.total, 3);
         assert_eq!(resp[0].crates[0].name, "foo_sort");
-        // same rank, by name asc
-        assert_eq!(resp[1].crates[0].name, "bar_sort");
-        assert_eq!(resp[2].crates[0].name, "baz_sort");
+        // same rank, by recent downloads desc (baz_sort 50, bar_sort 0)
+        assert_eq!(resp[1].crates[0].name, "baz_sort");
+        assert_eq!(resp[2].crates[0].name, "bar_sort");
     }
     assert_eq!(calls, 4);
     let ranks = querystring_rank(&mut conn, "foo_sort").await;
@@ -453,9 +625,9 @@ async fn index_sorting() -> anyhow::Result<()> {
     for json in search_both(&anon, query).await {
         assert_eq!(json.meta.total, 3);
         assert_eq!(resp[0].crates[0].name, "foo_sort");
-        // same rank, by name asc
-        assert_eq!(resp[1].crates[0].name, "bar_sort");
-        assert_eq!(resp[2].crates[0].name, "baz_sort");
+        // same rank, by recent downloads desc (baz_sort 50, bar_sort 0)
+        assert_eq!(resp[1].crates[0].name, "baz_sort");
+        assert_eq!(resp[2].crates[0].name, "bar_sort");
     }
     assert_eq!(calls, 4);
     let ranks = querystring_rank(&mut conn, "foo%20sort").await;
@@ -847,7 +1019,7 @@ async fn max_stable_version() -> anyhow::Result<()> {
 /// Given two crates, one with downloads less than 90 days ago, the
 /// other with all downloads greater than 90 days ago, check that
 /// the order returned is by recent downloads, descending. Check
-/// also that recent download counts are returned in recent_downloads,
+/// also that recent download counts are returned in `recent_downloads`,
 /// and total downloads counts are returned in downloads, and that
 /// these numbers do not overlap.
 #[tokio::test(flavor = "multi_thread")]
@@ -1073,7 +1245,7 @@ async fn seek_based_pagination() -> anyhow::Result<()> {
             assert_eq!(resp.meta.total, 3);
             assert!(default_versions_iter(&resp.crates).all(Option::is_some));
         } else {
-            assert_that!(resp.crates, empty());
+            assert_that!(resp.crates, is_empty());
             assert_eq!(resp.meta.total, 0);
         }
 
@@ -1140,7 +1312,7 @@ async fn invalid_seek_parameter() {
     let (_app, anon, _cookie) = TestApp::init().with_user().await;
 
     let response = anon.get::<()>("/api/v1/crates?seek=broken").await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid seek parameter"}]}"#);
 }
 
@@ -1163,13 +1335,13 @@ async fn pagination_parameters_only_accept_integers() {
     let response = anon
         .get_with_query::<()>("/api/v1/crates", "page=1&per_page=100%22%EF%BC%8Cexception")
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Failed to deserialize query string: per_page: invalid digit found in string"}]}"#);
 
     let response = anon
         .get_with_query::<()>("/api/v1/crates", "page=100%22%EF%BC%8Cexception&per_page=1")
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Failed to deserialize query string: page: invalid digit found in string"}]}"#);
 }
 
@@ -1198,7 +1370,7 @@ async fn crates_by_user_id_not_including_deleted_owners() -> anyhow::Result<()> 
     let krate = CrateBuilder::new("foo_my_packages", user.id)
         .expect_build(&mut conn)
         .await;
-    krate.owner_remove(&mut conn, "foo").await.unwrap();
+    krate.owner_remove(&conn, "foo").await.unwrap();
 
     for response in search_both_by_user_id(&anon, user.id).await {
         assert_eq!(response.crates.len(), 0);
@@ -1208,12 +1380,9 @@ async fn crates_by_user_id_not_including_deleted_owners() -> anyhow::Result<()> 
     Ok(())
 }
 
-static PAGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"((?:^page|&page|\?page)=\d+)").unwrap());
-
 // search with both offset-based (prepend with `page=1` query) and seek-based pagination
-async fn search_both<U: RequestHelper>(anon: &U, query: &str) -> [crate::tests::CrateList; 2] {
-    if PAGE_RE.is_match(query) {
+async fn search_both<U: RequestHelper>(anon: &U, query: &str) -> [crate::CrateList; 2] {
+    if regex!(r"((?:^page|&page|\?page)=\d+)").is_match(query) {
         panic!("url already contains page param");
     }
     let (offset, seek) = (
@@ -1240,18 +1409,12 @@ async fn search_both<U: RequestHelper>(anon: &U, query: &str) -> [crate::tests::
     [offset, seek]
 }
 
-async fn search_both_by_user_id<U: RequestHelper>(
-    anon: &U,
-    id: i32,
-) -> [crate::tests::CrateList; 2] {
+async fn search_both_by_user_id<U: RequestHelper>(anon: &U, id: i32) -> [crate::CrateList; 2] {
     let url = format!("user_id={id}");
     search_both(anon, &url).await
 }
 
-async fn page_with_seek<U: RequestHelper>(
-    anon: &U,
-    query: &str,
-) -> (Vec<crate::tests::CrateList>, i32) {
+async fn page_with_seek<U: RequestHelper>(anon: &U, query: &str) -> (Vec<crate::CrateList>, i32) {
     let mut url = Some(format!("?per_page=1&{query}"));
     let mut results = Vec::new();
     let mut calls = 0;
@@ -1269,7 +1432,7 @@ async fn page_with_seek<U: RequestHelper>(
             assert_ne!(resp.meta.total, 0);
             assert!(default_versions_iter(&resp.crates).all(Option::is_some));
         } else {
-            assert_that!(resp.crates, empty());
+            assert_that!(resp.crates, is_empty());
             assert_eq!(resp.meta.total, 0);
         }
         results.push(resp);
@@ -1278,12 +1441,12 @@ async fn page_with_seek<U: RequestHelper>(
 }
 
 fn default_versions_iter(
-    crates: &[crate::tests::EncodableCrate],
+    crates: &[crate::EncodableCrate],
 ) -> impl Iterator<Item = &Option<String>> {
     crates.iter().map(|c| &c.default_version)
 }
 
-fn yanked_iter(crates: &[crate::tests::EncodableCrate]) -> impl Iterator<Item = &bool> {
+fn yanked_iter(crates: &[crate::EncodableCrate]) -> impl Iterator<Item = &bool> {
     crates.iter().map(|c| &c.yanked)
 }
 

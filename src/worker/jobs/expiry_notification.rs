@@ -1,13 +1,16 @@
 use crate::models::ApiToken;
 use crate::schema::api_tokens;
-use crate::{Emails, email::Email, models::User, worker::Environment};
+use crate::{Emails, email::EmailMessage, models::User, worker::Environment};
 use chrono::SecondsFormat;
 use crates_io_worker::BackgroundJob;
 use diesel::dsl::now;
 use diesel::prelude::*;
 use diesel::sql_types::Timestamptz;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use minijinja::context;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{debug, error, info, instrument, warn};
 
 /// The threshold for the expiry notification.
 const EXPIRY_THRESHOLD: chrono::TimeDelta = chrono::TimeDelta::days(3);
@@ -34,7 +37,7 @@ impl BackgroundJob for SendTokenExpiryNotifications {
     }
 }
 
-/// Find tokens that are about to expire and send notifications to their owners.
+/// Finds tokens that are about to expire and sends notifications to their owners.
 async fn check(emails: &Emails, conn: &mut AsyncPgConnection) -> anyhow::Result<()> {
     let before = chrono::Utc::now() + EXPIRY_THRESHOLD;
     info!("Searching for tokens that will expire before {before}…");
@@ -70,7 +73,7 @@ async fn check(emails: &Emails, conn: &mut AsyncPgConnection) -> anyhow::Result<
     Ok(())
 }
 
-/// Send an email to the user associated with the token.
+/// Sends an email to the user associated with the token.
 async fn handle_expiring_token(
     conn: &mut AsyncPgConnection,
     token: &ApiToken,
@@ -83,12 +86,15 @@ async fn handle_expiring_token(
     let recipient = user.email(conn).await?;
     if let Some(recipient) = recipient {
         debug!("Sending expiry notification to {}…", recipient);
-        let email = ExpiryNotificationEmail {
-            name: &user.gh_login,
-            token_id: token.id,
-            token_name: &token.name,
-            expiry_date: token.expired_at.unwrap(),
-        };
+        let email = EmailMessage::from_template(
+            "expiry_notification",
+            context! {
+                name => user.gh_login,
+                token_id => token.id,
+                token_name => token.name,
+                expiry_date => token.expired_at.unwrap().to_rfc3339_opts(SecondsFormat::Secs, true)
+            },
+        )?;
         emails.send(&recipient, email).await?;
     } else {
         info!(
@@ -107,16 +113,16 @@ async fn handle_expiring_token(
     Ok(())
 }
 
-/// Find tokens that will expire before the given date, but haven't expired yet
+/// Finds tokens that will expire before the given date, but haven't expired yet
 /// and haven't been notified about their impending expiry. Revoked tokens are
 /// also ignored.
 ///
 /// This function returns at most `MAX_ROWS` tokens.
 pub async fn find_expiring_tokens(
-    conn: &mut AsyncPgConnection,
+    mut conn: &AsyncPgConnection,
     before: chrono::DateTime<chrono::Utc>,
 ) -> QueryResult<Vec<ApiToken>> {
-    api_tokens::table
+    ApiToken::query()
         .filter(api_tokens::revoked.eq(false))
         .filter(api_tokens::expired_at.is_not_null())
         // Ignore already expired tokens
@@ -127,53 +133,19 @@ pub async fn find_expiring_tokens(
                 .lt(before.naive_utc()),
         )
         .filter(api_tokens::expiry_notification_at.is_null())
-        .select(ApiToken::as_select())
         .order_by(api_tokens::expired_at.asc()) // The most urgent tokens first
         .limit(MAX_ROWS)
-        .get_results(conn)
+        .get_results(&mut conn)
         .await
-}
-
-#[derive(Debug, Clone)]
-struct ExpiryNotificationEmail<'a> {
-    name: &'a str,
-    token_id: i32,
-    token_name: &'a str,
-    expiry_date: chrono::DateTime<chrono::Utc>,
-}
-
-impl Email for ExpiryNotificationEmail<'_> {
-    fn subject(&self) -> String {
-        format!(
-            "crates.io: Your API token \"{}\" is about to expire",
-            self.token_name
-        )
-    }
-
-    fn body(&self) -> String {
-        format!(
-            r#"Hi {},
-
-We noticed your token "{}" will expire on {}.
-
-If this token is still needed, visit https://crates.io/settings/tokens/new?from={} to generate a new one.
-
-Thanks,
-The crates.io team"#,
-            self.name,
-            self.token_name,
-            self.expiry_date.to_rfc3339_opts(SecondsFormat::Secs, true),
-            self.token_id
-        )
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewEmail, NewUser};
+    use crate::models::NewEmail;
     use crate::{models::token::ApiToken, schema::api_tokens, util::token::PlainToken};
     use crates_io_test_db::TestDatabase;
+    use crates_io_test_utils::builders::UserBuilder;
     use diesel::dsl::IntervalDsl;
     use lettre::Address;
 
@@ -183,26 +155,25 @@ mod tests {
         let mut conn = test_db.async_connect().await;
 
         // Set up a user and a token that is about to expire.
-        let user = NewUser::builder()
-            .gh_id(0)
-            .gh_login("a")
-            .gh_access_token("token")
-            .build()
-            .insert(&mut conn)
-            .await?;
+        let user_id = UserBuilder::new()
+            .with_username("a")
+            .new_user()
+            .insert(&conn)
+            .await
+            .unwrap();
 
         NewEmail::builder()
-            .user_id(user.id)
+            .user_id(user_id)
             .email("testuser@test.com")
             .build()
-            .insert(&mut conn)
+            .insert(&conn)
             .await?;
 
         let token = PlainToken::generate();
 
         let token: ApiToken = diesel::insert_into(api_tokens::table)
             .values((
-                api_tokens::user_id.eq(user.id),
+                api_tokens::user_id.eq(user_id),
                 api_tokens::name.eq("test_token"),
                 api_tokens::token.eq(token.hashed()),
                 api_tokens::expired_at.eq(now.into_sql::<Timestamptz>().nullable()
@@ -218,7 +189,7 @@ mod tests {
             let token = PlainToken::generate();
             diesel::insert_into(api_tokens::table)
                 .values((
-                    api_tokens::user_id.eq(user.id),
+                    api_tokens::user_id.eq(user_id),
                     api_tokens::name.eq(format!("test_token{i}")),
                     api_tokens::token.eq(token.hashed()),
                     api_tokens::expired_at
@@ -243,19 +214,17 @@ mod tests {
             sent.1
                 .contains("crates.io: Your API token \"test_token\" is about to expire")
         );
-        let updated_token = api_tokens::table
+        let updated_token = ApiToken::query()
             .filter(api_tokens::id.eq(token.id))
             .filter(api_tokens::expiry_notification_at.is_not_null())
-            .select(ApiToken::as_select())
             .first::<ApiToken>(&mut conn)
             .await?;
         assert_eq!(updated_token.name, "test_token".to_owned());
 
         // Check that the token is not about to expire.
-        let tokens = api_tokens::table
+        let tokens = ApiToken::query()
             .filter(api_tokens::revoked.eq(false))
             .filter(api_tokens::expiry_notification_at.is_null())
-            .select(ApiToken::as_select())
             .load::<ApiToken>(&mut conn)
             .await?;
         assert_eq!(tokens.len(), 3);
@@ -264,7 +233,7 @@ mod tests {
         let token = PlainToken::generate();
         diesel::insert_into(api_tokens::table)
             .values((
-                api_tokens::user_id.eq(user.id),
+                api_tokens::user_id.eq(user_id),
                 api_tokens::name.eq("expired_token"),
                 api_tokens::token.eq(token.hashed()),
                 api_tokens::expired_at.eq(now.into_sql::<Timestamptz>().nullable() - 1.day()),

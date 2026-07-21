@@ -1,7 +1,9 @@
-use crate::models::Keyword;
-use crate::tests::builders::CrateBuilder;
-use crate::tests::util::{RequestHelper, TestApp};
-use crate::views::EncodableKeyword;
+use crate::builders::CrateBuilder;
+use crate::util::{RequestHelper, TestApp};
+use crates_io::models::Keyword;
+use crates_io::views::EncodableKeyword;
+use insta::assert_snapshot;
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct GoodKeyword {
@@ -12,11 +14,12 @@ struct GoodKeyword {
 async fn show() -> anyhow::Result<()> {
     let url = "/api/v1/keywords/foo";
     let (app, anon) = TestApp::init().empty().await;
-    let mut conn = app.db_conn().await;
+    let conn = app.db_conn().await;
 
-    anon.get(url).await.assert_not_found();
+    let response = anon.get::<()>(url).await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 
-    Keyword::find_or_create_all(&mut conn, &["foo"]).await?;
+    Keyword::find_or_create_all(&conn, &["foo"]).await?;
 
     let json: GoodKeyword = anon.get(url).await.good();
     assert_eq!(json.keyword.keyword.as_str(), "foo");
@@ -28,16 +31,28 @@ async fn show() -> anyhow::Result<()> {
 async fn uppercase() -> anyhow::Result<()> {
     let url = "/api/v1/keywords/UPPER";
     let (app, anon) = TestApp::init().empty().await;
-    let mut conn = app.db_conn().await;
+    let conn = app.db_conn().await;
 
-    anon.get(url).await.assert_not_found();
+    let response = anon.get::<()>(url).await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 
-    Keyword::find_or_create_all(&mut conn, &["UPPER"]).await?;
+    Keyword::find_or_create_all(&conn, &["UPPER"]).await?;
 
     let json: GoodKeyword = anon.get(url).await.good();
     assert_eq!(json.keyword.keyword.as_str(), "upper");
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn null_byte_in_name() {
+    let (_app, anon) = TestApp::init().empty().await;
+
+    // A keyword with a null byte can never exist, so instead of letting the
+    // request fail with a database encoding error it should be treated as a
+    // regular "not found" response.
+    let response = anon.get::<()>("/api/v1/keywords/foo%00bar").await;
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -51,7 +66,7 @@ async fn update_crate() -> anyhow::Result<()> {
         json.keyword.crates_cnt as usize
     }
 
-    Keyword::find_or_create_all(&mut conn, &["kw1", "kw2"]).await?;
+    Keyword::find_or_create_all(&conn, &["kw1", "kw2"]).await?;
     let krate = CrateBuilder::new("fookey", user.id)
         .expect_build(&mut conn)
         .await;

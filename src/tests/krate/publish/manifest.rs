@@ -1,8 +1,18 @@
-use crate::tests::builders::PublishBuilder;
-use crate::tests::util::insta::{any_id_redaction, id_redaction};
-use crate::tests::util::{RequestHelper, TestApp};
-use http::StatusCode;
+use crate::builders::PublishBuilder;
+use crate::util::insta::{any_id_redaction, id_redaction};
+use crate::util::{RequestHelper, TestApp};
+use crates_io::schema::versions;
+use diesel::QueryDsl;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use insta::{assert_json_snapshot, assert_snapshot};
+
+async fn lib_name_in_db(conn: &mut AsyncPgConnection) -> Option<String> {
+    versions::table
+        .select(versions::lib_name)
+        .first(conn)
+        .await
+        .unwrap()
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn boolean_readme() {
@@ -21,20 +31,22 @@ async fn boolean_readme() {
             readme = false"#,
         ))
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
     });
 
     let response = token.get::<()>("/api/v1/crates/foo/1.0.0").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".version.id" => any_id_redaction(),
         ".version.created_at" => "[datetime]",
         ".version.updated_at" => "[datetime]",
+        ".version.published_by.created_at" => "[datetime]",
         ".version.published_by.id" => id_redaction(token.as_model().user_id),
         ".version.audit_actions[].time" => "[datetime]",
+        ".version.audit_actions[].user.created_at" => "[datetime]",
         ".version.audit_actions[].user.id" => id_redaction(token.as_model().user_id),
     });
 }
@@ -46,7 +58,7 @@ async fn missing_manifest() {
     let response = token
         .publish_crate(PublishBuilder::new("foo", "1.0.0").no_manifest())
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"uploaded tarball is missing a `Cargo.toml` manifest file"}]}"#);
 }
 
@@ -64,7 +76,7 @@ async fn manifest_casing() {
                 .no_manifest(),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"uploaded tarball is missing a `Cargo.toml` manifest file; `CARGO.TOML` was found, but must be named `Cargo.toml` with that exact casing"}]}"#);
 }
 
@@ -86,7 +98,7 @@ async fn multiple_manifests() {
                 .no_manifest(),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"uploaded tarball contains more than one `Cargo.toml` manifest file; found `Cargo.toml`, `cargo.toml`"}]}"#);
 }
 
@@ -97,7 +109,7 @@ async fn invalid_manifest() {
     let response = token
         .publish_crate(PublishBuilder::new("foo", "1.0.0").custom_manifest(""))
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"failed to parse `Cargo.toml` manifest file\n\nmissing field `name`\n"}]}"#);
 }
 
@@ -110,7 +122,7 @@ async fn invalid_manifest_missing_name() {
             PublishBuilder::new("foo", "1.0.0").custom_manifest("[package]\nversion = \"1.0.0\""),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"failed to parse `Cargo.toml` manifest file\n\nTOML parse error at line 1, column 1\n  |\n1 | [package]\n  | ^^^^^^^^^\nmissing field `name`\n"}]}"#);
 }
 
@@ -123,8 +135,32 @@ async fn invalid_manifest_missing_version() {
             PublishBuilder::new("foo", "1.0.0").custom_manifest("[package]\nname = \"foo\""),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"failed to parse `Cargo.toml` manifest file\n\nmissing field `version`"}]}"#);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn name_mismatch() {
+    let (_app, _anon, _cookie, token) = TestApp::full().with_token().await;
+
+    let response =
+        token.publish_crate(PublishBuilder::new("foo", "1.0.0").custom_manifest(
+            "[package]\nname = \"bar\"\nversion = \"1.0.0\"\ndescription = \"description\"\nlicense = \"MIT\"\n",
+        )).await;
+    assert_snapshot!(response.status(), @"400 Bad Request");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"metadata name `foo` does not match manifest name `bar`"}]}"#);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_mismatch() {
+    let (_app, _anon, _cookie, token) = TestApp::full().with_token().await;
+
+    let response =
+        token.publish_crate(PublishBuilder::new("foo", "1.0.0").custom_manifest(
+            "[package]\nname = \"foo\"\nversion = \"2.0.0\"\ndescription = \"description\"\nlicense = \"MIT\"\n",
+        )).await;
+    assert_snapshot!(response.status(), @"400 Bad Request");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"metadata version `1.0.0` does not match manifest version `2.0.0`"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -135,19 +171,19 @@ async fn invalid_rust_version() {
         token.publish_crate(PublishBuilder::new("foo", "1.0.0").custom_manifest(
             "[package]\nname = \"foo\"\nversion = \"1.0.0\"\ndescription = \"description\"\nlicense = \"MIT\"\nrust-version = \"\"\n",
         )).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"failed to parse `Cargo.toml` manifest file\n\ninvalid `rust-version` value"}]}"#);
 
     let response = token.publish_crate(PublishBuilder::new("foo", "1.0.0").custom_manifest(
         "[package]\nname = \"foo\"\nversion = \"1.0.0\"\ndescription = \"description\"\nlicense = \"MIT\"\nrust-version = \"1.0.0-beta.2\"\n",
     )).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"failed to parse `Cargo.toml` manifest file\n\ninvalid `rust-version` value"}]}"#);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lib_and_bin_crate() {
-    let (_app, _anon, _cookie, token) = TestApp::full().with_token().await;
+    let (app, _anon, _cookie, token) = TestApp::full().with_token().await;
 
     let publish_builder = PublishBuilder::new("foo", "1.0.0")
         .add_file("foo-1.0.0/src/lib.rs", "pub fn foo() {}")
@@ -155,20 +191,78 @@ async fn test_lib_and_bin_crate() {
         .add_file("foo-1.0.0/src/bin/bar.rs", "fn main() {}");
 
     let response = token.publish_crate(publish_builder).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",
     });
 
     let response = token.get::<()>("/api/v1/crates/foo/1.0.0").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".version.id" => any_id_redaction(),
         ".version.created_at" => "[datetime]",
         ".version.updated_at" => "[datetime]",
+        ".version.published_by.created_at" => "[datetime]",
         ".version.published_by.id" => id_redaction(token.as_model().user_id),
         ".version.audit_actions[].time" => "[datetime]",
+        ".version.audit_actions[].user.created_at" => "[datetime]",
         ".version.audit_actions[].user.id" => id_redaction(token.as_model().user_id),
     });
+
+    let mut conn = app.db_conn().await;
+    assert_eq!(lib_name_in_db(&mut conn).await.as_deref(), Some("foo"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lib_name_hyphenated_crate() {
+    let (app, _anon, _cookie, token) = TestApp::full().with_token().await;
+
+    let publish_builder = PublishBuilder::new("foo-bar", "1.0.0")
+        .add_file("foo-bar-1.0.0/src/lib.rs", "pub fn foo() {}");
+
+    let response = token.publish_crate(publish_builder).await;
+    assert_snapshot!(response.status(), @"200 OK");
+
+    let mut conn = app.db_conn().await;
+    assert_eq!(lib_name_in_db(&mut conn).await.as_deref(), Some("foo_bar"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lib_name_custom() {
+    let (app, _anon, _cookie, token) = TestApp::full().with_token().await;
+
+    let publish_builder = PublishBuilder::new("foo", "1.0.0")
+        .custom_manifest(
+            r#"[package]
+name = "foo"
+version = "1.0.0"
+description = "description"
+license = "MIT"
+
+[lib]
+name = "my_lib"
+"#,
+        )
+        .add_file("foo-1.0.0/src/lib.rs", "pub fn foo() {}");
+
+    let response = token.publish_crate(publish_builder).await;
+    assert_snapshot!(response.status(), @"200 OK");
+
+    let mut conn = app.db_conn().await;
+    assert_eq!(lib_name_in_db(&mut conn).await.as_deref(), Some("my_lib"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lib_name_bin_only() {
+    let (app, _anon, _cookie, token) = TestApp::full().with_token().await;
+
+    let publish_builder =
+        PublishBuilder::new("foo", "1.0.0").add_file("foo-1.0.0/src/main.rs", "fn main() {}");
+
+    let response = token.publish_crate(publish_builder).await;
+    assert_snapshot!(response.status(), @"200 OK");
+
+    let mut conn = app.db_conn().await;
+    assert_eq!(lib_name_in_db(&mut conn).await, None);
 }

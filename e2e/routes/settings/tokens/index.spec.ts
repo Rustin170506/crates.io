@@ -2,7 +2,7 @@ import { expect, test } from '@/e2e/helper';
 
 test.describe('/settings/tokens', { tag: '@routes' }, () => {
   test('reloads all tokens from the server', async ({ page, msw }) => {
-    let user = msw.db.user.create({
+    let user = await msw.db.user.create({
       login: 'johnnydee',
       name: 'John Doe',
       email: 'john@doe.com',
@@ -11,7 +11,7 @@ test.describe('/settings/tokens', { tag: '@routes' }, () => {
 
     await msw.authenticateAs(user);
 
-    msw.db.apiToken.create({ user, name: 'token-1' });
+    await msw.db.apiToken.create({ user, name: 'token-1' });
 
     await page.goto('/settings/tokens/new');
     await expect(page).toHaveURL('/settings/tokens/new');
@@ -27,5 +27,30 @@ test.describe('/settings/tokens', { tag: '@routes' }, () => {
     await expect(tokens[0].locator('[data-test-token]')).toBeVisible();
     await expect(tokens[1].locator('[data-test-name]')).toHaveText('token-1');
     await expect(tokens[1].locator('[data-test-token]')).toHaveCount(0);
+  });
+
+  test('scope formatting', async ({ page, msw }) => {
+    let user = await msw.db.user.create({
+      login: 'johnnydee',
+      name: 'John Doe',
+      email: 'john@doe.com',
+      avatar: 'https://avatars2.githubusercontent.com/u/1234567?v=4',
+    });
+
+    await msw.authenticateAs(user);
+
+    await msw.db.apiToken.create({
+      user,
+      endpointScopes: ['publish-new', 'publish-update', 'yank'],
+      crateScopes: ['serde', 'serde-*', 'serde_*'],
+    });
+
+    await page.goto('/settings/tokens');
+    await expect(page).toHaveURL('/settings/tokens');
+    await expect(page.locator('[data-test-api-token]')).toHaveCount(1);
+    await expect(page.locator('[data-test-endpoint-scopes]')).toHaveText(
+      'Scopes: publish-new, publish-update, and yank',
+    );
+    await expect(page.locator('[data-test-crate-scopes]')).toHaveText('Crates: serde, serde-*, and serde_*');
   });
 });

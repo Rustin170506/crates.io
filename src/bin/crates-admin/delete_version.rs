@@ -2,12 +2,11 @@ use crate::dialoguer;
 use anyhow::Context;
 use crates_io::models::update_default_version;
 use crates_io::schema::crates;
-use crates_io::storage::Storage;
+use crates_io::storage::{Storage, StorageKey, release_cache_tag};
 use crates_io::worker::jobs;
-use crates_io::{db, schema::versions};
+use crates_io::{config::FeaturesConfig, db, schema::versions};
 use crates_io_worker::BackgroundJob;
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 
 #[derive(clap::Parser, Debug)]
@@ -30,6 +29,8 @@ pub struct Opts {
 }
 
 pub async fn run(opts: Opts) -> anyhow::Result<()> {
+    let features = FeaturesConfig::from_env().context("Failed to load features config")?;
+
     let mut conn = db::oneoff_connection()
         .await
         .context("Failed to establish database connection")?;
@@ -59,7 +60,7 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         }
     }
 
-    let opts = conn.transaction(|conn| async move {
+    let opts = conn.transaction(async |conn| {
         let crate_name = &opts.crate_name;
 
         info!(%crate_name, %crate_id, versions = ?opts.versions, "Deleting versions from the database");
@@ -80,17 +81,17 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
                 );
             }
             Err(error) => {
-                warn!(%crate_name, ?error, "Failed to delete versions from the database")
+                warn!(%crate_name, "Failed to delete versions from the database: {error}")
             }
         }
 
         info!(%crate_name, %crate_id, "Updating default version in the database");
         if let Err(error) = update_default_version(crate_id, conn).await {
-            warn!(%crate_name, %crate_id, ?error, "Failed to update default version");
+            warn!(%crate_name, %crate_id, "Failed to update default version: {error}");
         }
 
         Ok::<_, anyhow::Error>(opts)
-    }.scope_boxed()).await?;
+    }).await?;
 
     let crate_name = &opts.crate_name;
 
@@ -99,26 +100,74 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
     let sparse_index_job = jobs::SyncToSparseIndex::new(crate_name);
 
     if let Err(error) = tokio::try_join!(
-        git_index_job.enqueue(&mut conn),
-        sparse_index_job.enqueue(&mut conn),
+        git_index_job.enqueue(&conn),
+        sparse_index_job.enqueue(&conn),
     ) {
         warn!(%crate_name, "Failed to enqueue background job: {error}");
     }
 
+    let mut paths = Vec::new();
     for version in &opts.versions {
         debug!(%crate_name, %version, "Deleting crate file from S3");
-        if let Err(error) = store.delete_crate_file(crate_name, version).await {
-            warn!(%crate_name, %version, ?error, "Failed to delete crate file from S3");
+        let crate_file_key = StorageKey::for_crate_file(crate_name, version);
+        match store.delete(&crate_file_key).await {
+            Err(error) => {
+                warn!(%crate_name, %version, "Failed to delete crate file from S3: {error}");
+            }
+            Ok(()) => {
+                paths.push(crate_file_key.path());
+            }
+        }
+
+        debug!(%crate_name, %version, "Deleting zip source archive from S3");
+        let zip_key = StorageKey::for_crate_zip(crate_name, version);
+        match store.delete(&zip_key).await {
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => {
+                warn!(%crate_name, %version, "Failed to delete zip source archive from S3: {error}")
+            }
+            Ok(()) => {
+                paths.push(zip_key.path());
+            }
+        }
+
+        debug!(%crate_name, %version, "Deleting zip source archive manifest from S3");
+        let manifest_key = StorageKey::for_crate_zip_manifest(crate_name, version);
+        match store.delete(&manifest_key).await {
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => {
+                warn!(%crate_name, %version, "Failed to delete zip source archive manifest from S3: {error}")
+            }
+            Ok(()) => {
+                paths.push(manifest_key.path());
+            }
         }
 
         debug!(%crate_name, %version, "Deleting readme file from S3");
-        match store.delete_readme(crate_name, version).await {
+        let readme_key = StorageKey::for_readme(crate_name, version);
+        match store.delete(&readme_key).await {
             Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => {
-                warn!(%crate_name, %version, ?error, "Failed to delete readme file from S3")
+                warn!(%crate_name, %version, "Failed to delete readme file from S3: {error}")
             }
-            Ok(_) => {}
+            Ok(()) => {
+                paths.push(readme_key.path());
+            }
         }
+    }
+
+    let job = if features.cache_tag_invalidations_enabled {
+        jobs::InvalidateCdns::cache_tags(
+            opts.versions
+                .iter()
+                .map(|version| release_cache_tag(crate_name, version)),
+        )
+    } else {
+        jobs::InvalidateCdns::paths(paths.into_iter())
+    };
+
+    if let Err(e) = job.enqueue(&conn).await {
+        warn!("{crate_name}: Failed to enqueue CDN invalidation background job: {e}");
     }
 
     Ok(())

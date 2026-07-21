@@ -1,0 +1,75 @@
+name: Update CDN IP Ranges
+
+on:
+  # run if manually triggered
+  workflow_dispatch:
+
+  # run if something on the `main` branch changes
+  push:
+    branches:
+      - main
+
+  # run every hour at XX:42
+  schedule:
+    - cron: '42 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: update-cdn-ip-ranges
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'rust-lang' }}
+    permissions:
+      contents: write # needed to `git push` the updated CDN IP ranges back to the `main` branch
+
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.WORKFLOWS_CRATES_IO_APP_ID }}
+          private-key: ${{ secrets.WORKFLOWS_CRATES_IO_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env] repository write access is already the effective boundary; an environment adds no meaningful protection
+          permission-contents: write
+
+      - name: Get GitHub App User ID
+        id: get-user-id
+        run: echo "user-id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - run: git config --global user.name "${APP_SLUG}[bot]"
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+
+      - run: git config --global user.email "${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          USER_ID: ${{ steps.get-user-id.outputs.user-id }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - run: python3 crates/crates_io_real_ip/update-data.py
+
+      - run: git diff --exit-code
+        id: git-diff
+        continue-on-error: true
+
+      # Prevent build failures from getting a git commit
+      - run: cargo check --package crates_io_real_ip
+        if: steps.git-diff.outcome == 'failure'
+
+      - run: git commit --all --message "Update CDN IP ranges data"
+        if: steps.git-diff.outcome == 'failure'
+
+      - run: git push origin main
+        if: steps.git-diff.outcome == 'failure'

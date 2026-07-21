@@ -3,37 +3,24 @@ import { loadFixtures } from '@crates-io/msw/fixtures';
 import { http, HttpResponse } from 'msw';
 
 test.describe('Acceptance | crates page', { tag: '@acceptance' }, () => {
-  // should match the default set in the crates controller
-  const per_page = 50;
+  test('visiting the crates page', async ({ page, msw, percy, a11y }) => {
+    await loadFixtures(msw.db);
 
-  test('visiting the crates page from the front page', async ({ page, msw, percy, a11y }) => {
-    loadFixtures(msw.db);
-
-    await page.goto('/');
-    await page.click('[data-test-all-crates-link]');
+    await page.goto('/crates');
 
     await expect(page).toHaveURL('/crates');
     await expect(page).toHaveTitle('Crates - crates.io: Rust Package Registry');
 
     await percy.snapshot();
+    await expect(page).toMatchAriaSnapshot({ name: 'aria.yml' });
     await a11y.audit();
   });
 
-  test('visiting the crates page directly', async ({ page, msw }) => {
-    loadFixtures(msw.db);
-
-    await page.goto('/crates');
-    await page.click('[data-test-all-crates-link]');
-
-    await expect(page).toHaveURL('/crates');
-    await expect(page).toHaveTitle('Crates - crates.io: Rust Package Registry');
-  });
-
   test('listing crates', async ({ page, msw }) => {
-    const per_page = 50;
+    let per_page = 50;
     for (let i = 1; i <= per_page; i++) {
-      let crate = msw.db.crate.create();
-      msw.db.version.create({ crate });
+      let crate = await msw.db.crate.create({});
+      await msw.db.version.create({ crate });
     }
 
     await page.goto('/crates');
@@ -43,13 +30,13 @@ test.describe('Acceptance | crates page', { tag: '@acceptance' }, () => {
   });
 
   test('navigating to next page of crates', async ({ page, msw }) => {
-    const per_page = 50;
+    let per_page = 50;
     for (let i = 1; i <= per_page + 2; i++) {
-      let crate = msw.db.crate.create();
-      msw.db.version.create({ crate });
+      let crate = await msw.db.crate.create({});
+      await msw.db.version.create({ crate });
     }
-    const page_start = per_page + 1;
-    const total = per_page + 2;
+    let page_start = per_page + 1;
+    let total = per_page + 2;
 
     await page.goto('/crates');
     await page.click('[data-test-pagination-next]');
@@ -60,7 +47,7 @@ test.describe('Acceptance | crates page', { tag: '@acceptance' }, () => {
   });
 
   test('crates default sort is alphabetical', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/crates');
 
@@ -68,26 +55,30 @@ test.describe('Acceptance | crates page', { tag: '@acceptance' }, () => {
   });
 
   test('downloads appears for each crate on crate list', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/crates');
-    await expect(page.locator('[data-test-crate-row="0"] [data-test-downloads]')).toHaveText('All-Time: 21,573');
+    await expect(page.locator('[data-test-crate-row="0"] [data-test-downloads]')).toHaveText(
+      /All-Time\s*Downloads:\s*21,573/,
+    );
   });
 
   test('recent downloads appears for each crate on crate list', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     await page.goto('/crates');
-    await expect(page.locator('[data-test-crate-row="0"] [data-test-recent-downloads]')).toHaveText('Recent: 2,000');
+    await expect(page.locator('[data-test-crate-row="0"] [data-test-recent-downloads]')).toHaveText(
+      /Recent\s*Downloads:\s*2,000/,
+    );
   });
 
   test('shows error message screen', async ({ page, msw }) => {
-    loadFixtures(msw.db);
+    await loadFixtures(msw.db);
 
     let detail =
       'Page 1 is unavailable for performance reasons. Please take a look at https://crates.io/data-access for alternatives.';
     let error = HttpResponse.json({ errors: [{ detail }] }, { status: 400 });
-    await msw.worker.use(http.get('/api/v1/crates', () => error));
+    msw.worker.use(http.get('/api/v1/crates', () => error));
 
     await page.goto('/crates');
     await expect(page.locator('[data-test-404-page]')).toBeVisible();

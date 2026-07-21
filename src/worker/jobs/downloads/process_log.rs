@@ -8,17 +8,18 @@ use diesel::dsl::exists;
 use diesel::prelude::*;
 use diesel::{QueryResult, select};
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::BufReader;
+use tracing::{debug, info, instrument, warn};
 
 /// A background job that loads a CDN log file from an object store (aka. S3),
 /// counts the number of downloads for each crate and version, and then inserts
@@ -59,10 +60,10 @@ impl BackgroundJob for ProcessCdnLog {
     }
 }
 
-/// Builds an object store based on the [CdnLogStorageConfig] and the
+/// Builds an object store based on the [`CdnLogStorageConfig`] and the
 /// `region` and `bucket` arguments.
 ///
-/// If the passed in [CdnLogStorageConfig] is using local file or in-memory
+/// If the passed in [`CdnLogStorageConfig`] is using local file or in-memory
 /// storage the `region` and `bucket` arguments are ignored.
 fn build_store(
     config: &CdnLogStorageConfig,
@@ -93,7 +94,7 @@ fn build_store(
 }
 
 /// Loads the given log file from the object store and counts the number of
-/// downloads for each crate and version. The results are printed to the log.
+/// downloads for each crate and version. The results are saved to the database.
 ///
 /// This function is separate from the [`BackgroundJob`] trait method so that
 /// it can be tested without having to construct a full [`Environment`]
@@ -122,23 +123,20 @@ async fn run(
 
     let path = path.to_string();
     let mut conn = db_pool.get().await?;
-    conn.transaction(|conn| {
-        async move {
-            // Mark the log file as processed before saving the downloads to
-            // the database.
-            //
-            // If a second job is already processing the same log file, this
-            // call will block until the second job has finished its
-            // transaction and marked the log file as processed. Afterward
-            // this call will throw a uniqueness error and fail the job.
-            // When the job is retried the `already_processed()` call above
-            // will return `true` and the job will skip processing the log
-            // file again.
-            save_as_processed(path, conn).await?;
+    conn.transaction(async |conn| {
+        // Mark the log file as processed before saving the downloads to
+        // the database.
+        //
+        // If a second job is already processing the same log file, this
+        // call will block until the second job has finished its
+        // transaction and marked the log file as processed. Afterward
+        // this call will throw a uniqueness error and fail the job.
+        // When the job is retried the `already_processed()` call above
+        // will return `true` and the job will skip processing the log
+        // file again.
+        save_as_processed(path, conn).await?;
 
-            save_downloads(downloads, conn).await
-        }
-        .scope_boxed()
+        save_downloads(downloads, conn).await
     })
     .await?;
 
@@ -370,8 +368,8 @@ async fn already_processed(
 ) -> anyhow::Result<bool> {
     let path = path.into();
 
-    let mut conn = db_pool.get().await?;
-    let already_processed = already_processed_inner(path, &mut conn).await?;
+    let conn = db_pool.get().await?;
+    let already_processed = already_processed_inner(path, &conn).await?;
 
     Ok(already_processed)
 }
@@ -384,12 +382,12 @@ async fn already_processed(
 /// the path into the `processed_log_files` table yet.
 async fn already_processed_inner(
     path: impl Into<String>,
-    conn: &mut AsyncPgConnection,
+    mut conn: &AsyncPgConnection,
 ) -> QueryResult<bool> {
     use crate::schema::processed_log_files;
 
     let query = processed_log_files::table.filter(processed_log_files::path.eq(path.into()));
-    select(exists(query)).get_result(conn).await
+    select(exists(query)).get_result(&mut conn).await
 }
 
 /// Inserts the given path into the `processed_log_files` table to mark it as
@@ -412,6 +410,7 @@ async fn save_as_processed(
 mod tests {
     use super::*;
     use crate::schema::{crates, version_downloads, versions};
+    use claims::assert_ok;
     use crates_io_test_db::TestDatabase;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use insta::assert_debug_snapshot;
@@ -520,7 +519,7 @@ mod tests {
                 versions::crate_id.eq(crate_id),
                 versions::num.eq(version),
                 versions::num_no_build.eq(version),
-                versions::checksum.eq("checksum"),
+                versions::tar_sha256.eq(vec![0u8; 32]),
                 versions::crate_size.eq(0),
             ))
             .execute(conn)
@@ -531,8 +530,8 @@ mod tests {
     /// Queries all version downloads from the database and returns them as a
     /// [`Vec`] of strings for use with [`assert_debug_snapshot!()`].
     async fn all_version_downloads(db_pool: Pool<AsyncPgConnection>) -> Vec<String> {
-        let mut conn = db_pool.get().await.unwrap();
-        let downloads = query_all_version_downloads(&mut conn).await;
+        let conn = db_pool.get().await.unwrap();
+        let downloads = query_all_version_downloads(&conn).await;
 
         downloads
             .into_iter()
@@ -545,7 +544,7 @@ mod tests {
     /// Queries all version downloads from the database and returns them as a
     /// [`Vec`] of tuples.
     async fn query_all_version_downloads(
-        conn: &mut AsyncPgConnection,
+        mut conn: &AsyncPgConnection,
     ) -> Vec<(String, String, i32, i32, NaiveDate, bool)> {
         version_downloads::table
             .inner_join(versions::table)
@@ -559,7 +558,7 @@ mod tests {
                 version_downloads::processed,
             ))
             .order((crates::name, versions::num, version_downloads::date))
-            .load(conn)
+            .load(&mut conn)
             .await
             .unwrap()
     }

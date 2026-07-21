@@ -1,7 +1,6 @@
-use crate::tests::builders::{CrateBuilder, DependencyBuilder, PublishBuilder};
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::{CrateBuilder, DependencyBuilder, PublishBuilder};
+use crate::util::{RequestHelper, TestApp};
 use googletest::prelude::*;
-use http::StatusCode;
 use insta::{assert_json_snapshot, assert_snapshot};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11,14 +10,14 @@ async fn invalid_dependency_name() {
     let response = token
         .publish_crate(PublishBuilder::new("foo", "1.0.0").dependency(DependencyBuilder::new("🦀")))
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid character `🦀` in dependency name: `🦀`, the first character must be an ASCII character"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn new_with_renamed_dependency() {
-    let (app, _, user, token) = TestApp::full().with_token().await;
+    let (app, _, user, token) = TestApp::full().with_git_index().with_token().await;
     let mut conn = app.db_conn().await;
 
     // Insert a crate directly into the database so that new-krate can depend on it
@@ -51,9 +50,9 @@ async fn invalid_dependency_rename() {
                 .dependency(DependencyBuilder::new("package-name").rename("💩")),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid character `💩` in dependency name: `💩`, the first character must be an ASCII character, or `_`"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -72,9 +71,9 @@ async fn invalid_dependency_name_starts_with_digit() {
                 .dependency(DependencyBuilder::new("package-name").rename("1-foo")),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"the name `1-foo` cannot be used as a dependency name, the name cannot start with a digit"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -93,9 +92,9 @@ async fn invalid_dependency_name_contains_unicode_chars() {
                 .dependency(DependencyBuilder::new("package-name").rename("foo-🦀-bar")),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid character `🦀` in dependency name: `foo-🦀-bar`, characters must be an ASCII alphanumeric characters, `-`, or `_`"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -114,9 +113,9 @@ async fn invalid_too_long_dependency_name() {
                 .dependency(DependencyBuilder::new("package-name").rename("f".repeat(65).as_str())),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"the dependency name `fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff` is too long (max 64 characters)"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -135,14 +134,14 @@ async fn empty_dependency_name() {
                 .dependency(DependencyBuilder::new("package-name").rename("")),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"dependency name cannot be empty"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn new_with_underscore_renamed_dependency() {
-    let (app, _, user, token) = TestApp::full().with_token().await;
+    let (app, _, user, token) = TestApp::full().with_git_index().with_token().await;
     let mut conn = app.db_conn().await;
 
     // Insert a crate directly into the database so that new-krate can depend on it
@@ -161,9 +160,9 @@ async fn new_with_underscore_renamed_dependency() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn new_krate_with_dependency() {
-    use crate::tests::routes::crates::versions::dependencies::Deps;
+    use crate::routes::crates::versions::dependencies::Deps;
 
-    let (app, anon, user, token) = TestApp::full().with_token().await;
+    let (app, anon, user, token) = TestApp::full().with_git_index().with_token().await;
     let mut conn = app.db_conn().await;
 
     // Insert a crate directly into the database so that new_dep can depend on it
@@ -211,9 +210,9 @@ async fn new_krate_with_broken_dependency_requirement() {
 
     let crate_to_publish = PublishBuilder::new("new_dep", "1.0.0").dependency(dependency);
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"\"broken\" is an invalid version requirement"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -231,9 +230,9 @@ async fn reject_new_krate_with_non_exact_dependency() {
     let crate_to_publish = PublishBuilder::new("new_dep", "1.0.0").dependency(dependency);
 
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"no known crate named `foo_dep`"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -260,9 +259,9 @@ async fn reject_new_crate_with_alternative_registry_dependency() {
     let crate_to_publish =
         PublishBuilder::new("depends-on-alt-registry", "1.0.0").dependency(dependency);
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"Dependency `dep` is hosted on another registry. Cross-registry dependencies are not permitted on crates.io."}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -280,9 +279,41 @@ async fn new_krate_with_wildcard_dependency() {
     let crate_to_publish = PublishBuilder::new("new_wild", "1.0.0").dependency(dependency);
 
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"wildcard (`*`) dependency constraints are not allowed on crates.io. Crate with this problem: `foo_wild` See https://doc.rust-lang.org/cargo/faq.html#can-libraries-use--as-a-version-for-their-dependencies for more information"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_krate_with_patch() {
+    let (app, _, user, token) = TestApp::full().with_token().await;
+    let mut conn = app.db_conn().await;
+
+    // Insert a crate directly into the database so that new_wild can depend on it
+    CrateBuilder::new("foo_patch", user.as_model().id)
+        .expect_build(&mut conn)
+        .await;
+
+    let manifest = r#"
+    [package]
+    name = "new_patch"
+    version = "1.0.0"
+    description = "foo?!"
+    license = "MIT"
+
+    [dependencies]
+    foo_patch = "1.0.0"
+
+    [patch.crates-io]
+    foo_patch = { git = "https://github.com/foo/patch.git" }
+    "#;
+
+    let crate_to_publish = PublishBuilder::new("new_patch", "1.0.0").custom_manifest(manifest);
+
+    let response = token.publish_crate(crate_to_publish).await;
+    assert_snapshot!(response.status(), @"400 Bad Request");
+    assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"failed to parse `Cargo.toml` manifest file\n\ncrates cannot be published with `[patch]` tables"}]}"#);
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -295,14 +326,14 @@ async fn new_krate_dependency_missing() {
     let crate_to_publish = PublishBuilder::new("foo_missing", "1.0.0").dependency(dependency);
 
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"no known crate named `bar_missing`"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn new_krate_sorts_deps() {
-    let (app, _, user, token) = TestApp::full().with_token().await;
+    let (app, _, user, token) = TestApp::full().with_git_index().with_token().await;
     let mut conn = app.db_conn().await;
 
     // Insert crates directly into the database so that two-deps can depend on it
@@ -336,15 +367,15 @@ async fn invalid_feature_name() {
                 .dependency(DependencyBuilder::new("bar").add_feature("🍺")),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"invalid character `🍺` in feature `🍺`, the first character must be a Unicode XID start character or digit (most letters or `_` or `0` to `9`)"}]}"#);
-    assert_that!(app.stored_files().await, empty());
+    assert_that!(app.stored_files().await, is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dep_limit() {
     let (app, _, user, token) = TestApp::full()
-        .with_config(|config| config.max_dependencies = 1)
+        .with_config(|config| config.publish_limits.dependencies = 1)
         .with_token()
         .await;
 
@@ -362,14 +393,14 @@ async fn test_dep_limit() {
         .dependency(DependencyBuilder::new("dep-b"));
 
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_snapshot!(response.status(), @"400 Bad Request");
     assert_snapshot!(response.text(), @r#"{"errors":[{"detail":"crates.io only allows a maximum number of 1 dependencies.\n\nIf you have a use case that requires an increase of this limit, please send us an email to help@crates.io to discuss the details."}]}"#);
 
     let crate_to_publish =
         PublishBuilder::new("foo", "1.0.0").dependency(DependencyBuilder::new("dep-a"));
 
     let response = token.publish_crate(crate_to_publish).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
     assert_json_snapshot!(response.json(), {
         ".crate.created_at" => "[datetime]",
         ".crate.updated_at" => "[datetime]",

@@ -1,10 +1,11 @@
-use crate::tests::builders::CrateBuilder;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::CrateBuilder;
+use crate::util::{RequestHelper, TestApp};
+use claims::{assert_ok, assert_some};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use googletest::assert_that;
 use googletest::matchers::ends_with;
-use http::StatusCode;
+use insta::assert_snapshot;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -36,18 +37,18 @@ async fn http_error_with_unhealthy_database() -> anyhow::Result<()> {
     let (app, anon) = TestApp::init().with_chaos_proxy().empty().await;
 
     let response = anon.get::<()>("/api/v1/summary").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
 
     app.primary_db_chaosproxy().break_networking()?;
 
     let response = anon.get::<()>("/api/v1/summary").await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_snapshot!(response.status(), @"503 Service Unavailable");
 
     app.primary_db_chaosproxy().restore_networking()?;
     wait_until_healthy(&app.as_inner().primary_database).await;
 
     let response = anon.get::<()>("/api/v1/summary").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
 
     Ok(())
 }
@@ -60,13 +61,12 @@ async fn download_requests_with_unhealthy_database_succeed() -> anyhow::Result<(
     CrateBuilder::new("foo", token.as_model().user_id)
         .version("1.0.0")
         .build(&mut conn)
-        .await
-        .unwrap();
+        .await?;
 
     app.primary_db_chaosproxy().break_networking()?;
 
     let response = anon.get::<()>("/api/v1/crates/foo/1.0.0/download").await;
-    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_snapshot!(response.status(), @"302 Found");
 
     let location = assert_some!(response.headers().get("location"));
     let location = assert_ok!(location.to_str());
@@ -89,7 +89,7 @@ async fn fallback_to_replica_returns_user_info() -> anyhow::Result<()> {
 
     // When the primary database is down, requests are forwarded to the replica database
     let response = owner.get::<()>(URL).await;
-    assert_eq!(response.status(), 200);
+    assert_snapshot!(response.status(), @"200 OK");
 
     // restore primary database connection
     app.primary_db_chaosproxy().restore_networking()?;
@@ -113,7 +113,7 @@ async fn restored_replica_returns_user_info() -> anyhow::Result<()> {
 
     // When both primary and replica database are down, the request returns an error
     let response = owner.get::<()>(URL).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_snapshot!(response.status(), @"503 Service Unavailable");
 
     // Once the replica database is restored, it should serve as a fallback again
     app.replica_db_chaosproxy().restore_networking()?;
@@ -125,7 +125,7 @@ async fn restored_replica_returns_user_info() -> anyhow::Result<()> {
     wait_until_healthy(replica).await;
 
     let response = owner.get::<()>(URL).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
 
     // restore connection
     app.primary_db_chaosproxy().restore_networking()?;
@@ -149,14 +149,14 @@ async fn restored_primary_returns_user_info() -> anyhow::Result<()> {
 
     // When both primary and replica database are down, the request returns an error
     let response = owner.get::<()>(URL).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_snapshot!(response.status(), @"503 Service Unavailable");
 
     // Once the replica database is restored, it should serve as a fallback again
     app.primary_db_chaosproxy().restore_networking()?;
     wait_until_healthy(&app.as_inner().primary_database).await;
 
     let response = owner.get::<()>(URL).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_snapshot!(response.status(), @"200 OK");
 
     Ok(())
 }

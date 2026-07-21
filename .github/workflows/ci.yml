@@ -8,244 +8,196 @@ on:
 
   pull_request:
 
+permissions: {}
+
 concurrency:
   group: ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # renovate: datasource=crate depName=cargo-deny versioning=semver
-  CARGO_DENY_VERSION: 0.18.2
-  # renovate: datasource=crate depName=cargo-machete versioning=semver
-  CARGO_MACHETE_VERSION: 0.8.0
-  # renovate: datasource=npm depName=pnpm
-  PNPM_VERSION: 10.6.2
-  # renovate: datasource=docker depName=postgres
-  POSTGRES_VERSION: 16
 
 jobs:
-  changed-files:
-    name: Changed Files
+  filter-jobs:
+    name: Filter Jobs
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # This is needed to get the commit history for the changed-files action
+          # (see https://github.com/tj-actions/changed-files/blob/v46.0.5/README.md#usage-)
+          fetch-depth: 0
 
-      - uses: tj-actions/changed-files@dcc7a0cba800f454d79fff4b993e8c3555bcc0a8 # v45.0.7
-        id: changed-files-non-js
+      - uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        id: changed-files
         with:
-          files_ignore: |
-            app/**
-            e2e/**
-            packages/**
-            public/**
-            tests/**
-            eslint.config.mjs
-            .template-lintrc.js
-            ember-cli-build.js
-            package.json
-            pnpm-lock.yaml
-            testem.js
-
-      - uses: tj-actions/changed-files@dcc7a0cba800f454d79fff4b993e8c3555bcc0a8 # v45.0.7
-        id: changed-files-non-rust
-        with:
-          files_ignore: |
-            crates/**
-            migrations/**
-            src/**
-            build.rs
-            Cargo.lock
-            Cargo.toml
-            rust-toolchain.toml
-
-      - uses: tj-actions/changed-files@dcc7a0cba800f454d79fff4b993e8c3555bcc0a8 # v45.0.7
-        id: changed-files-rust-lockfile
-        with:
-          files: Cargo.lock
+          files_yaml_from_source_file: .github/changed-files.yml
 
     outputs:
-      non-js: ${{ steps.changed-files-non-js.outputs.any_modified }}
-      non-rust: ${{ steps.changed-files-non-rust.outputs.any_modified }}
-      rust-lockfile: ${{ steps.changed-files-rust-lockfile.outputs.any_modified }}
-
-  percy-nonce:
-    name: Frontend / Percy Nonce
-    runs-on: ubuntu-latest
-    needs: changed-files
-    if: needs.changed-files.outputs.non-rust == 'true'
-
-    # persist job results to other jobs in the workflow
-    outputs:
-      nonce: ${{ steps.percy-nonce.outputs.nonce }}
-
-    steps:
-      # persist step results to other steps in the job
-      - id: percy-nonce
-        # adding a timestamp makes the nonce more unique for re-runs
-        run: echo "nonce=${{ github.run_id }}-$(date +%s)" >> $GITHUB_OUTPUT
+      backend-lint: ${{ steps.changed-files.outputs.backend_lint_any_modified }}
+      backend-deps: ${{ steps.changed-files.outputs.backend_deps_any_modified || github.event_name == 'push' }}
+      backend-migrations: ${{ steps.changed-files.outputs.backend_migrations_any_modified }}
+      backend-test: ${{ steps.changed-files.outputs.backend_test_any_modified }}
+      frontend-lint: ${{ steps.changed-files.outputs.frontend_lint_any_modified }}
+      msw-test: ${{ steps.changed-files.outputs.msw_test_any_modified }}
+      api-client-test: ${{ steps.changed-files.outputs.api_client_test_any_modified }}
+      e2e-test: ${{ steps.changed-files.outputs.e2e_test_any_modified }}
+      svelte: ${{ steps.changed-files.outputs.svelte_any_modified }}
+      zizmor: ${{ steps.changed-files.outputs.zizmor_any_modified }}
 
   backend-lint:
     name: Backend / Lint
     runs-on: ubuntu-24.04
-    needs: changed-files
-    if: needs.changed-files.outputs.non-js == 'true'
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.backend-lint == 'true'
 
     env:
-      RUSTFLAGS: "-D warnings"
-      RUSTDOCFLAGS: "-D warnings"
+      RUSTFLAGS: '-D warnings'
+      RUSTDOCFLAGS: '-D warnings'
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - run: rustup component add rustfmt
       - run: rustup component add clippy
 
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - run: cargo fmt --check --all
       - run: cargo clippy --all-targets --all-features --workspace
-      - run: cargo doc --no-deps --document-private-items
+      - run: cargo doc --no-deps --document-private-items --workspace
 
   backend-deps:
     name: Backend / dependencies
     runs-on: ubuntu-24.04
-    needs: changed-files
-    if: github.event_name != 'pull_request' || needs.changed-files.outputs.rust-lockfile == 'true'
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.backend-deps == 'true'
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          version: 2026.7.7
+          install_args: cargo:cargo-deny cargo:cargo-machete
 
-      - run: cargo install cargo-deny --vers ${CARGO_DENY_VERSION}
       - run: cargo deny check
-
-      - run: cargo install cargo-machete --vers ${CARGO_MACHETE_VERSION}
       - run: cargo machete
+
+  backend-migrations:
+    name: Backend / migrations
+    runs-on: ubuntu-24.04
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.backend-migrations == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: cargo:diesel-guard
+
+      - run: diesel-guard check migrations/
 
   backend-test:
     name: Backend / Test
     runs-on: ubuntu-24.04
-    needs: changed-files
-    if: needs.changed-files.outputs.non-js == 'true'
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.backend-test == 'true'
 
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       RUST_BACKTRACE: 1
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/postgres
-      RUSTFLAGS: "-D warnings -Cinstrument-coverage"
-      MALLOC_CONF: "background_thread:true,abort_conf:true,abort:true,junk:true"
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/cargo_registry_test
+      RUSTFLAGS: '-D warnings'
+      MALLOC_CONF: 'background_thread:true,abort_conf:true,abort:true,junk:true'
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Remove the Android SDK to free up space
-      - run: sudo rm -rf /usr/local/lib/android
+      # Remove the Android SDK in the background to free up space
+      - run: sudo rm -rf /usr/local/lib/android &
 
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+      - name: Download Fira Sans font
+        run: |
+          wget -q "https://github.com/mozilla/Fira/archive/4.202.zip"
+          unzip -q "4.202.zip"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Update `pg_dump` to the same version as the running PostgreSQL server
-      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -v ${POSTGRES_VERSION} -i -p
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: cargo-insta
+
       - run: sudo systemctl start postgresql.service
       - run: sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'postgres'"
+      - run: sudo -u postgres createdb --lc-collate=C --lc-ctype=C -T template0 cargo_registry_test
 
+      - run: cargo fetch --locked
       - run: cargo build --tests --workspace
-      - run: cargo test --workspace
+      - run: cargo insta test --require-full-match --unreferenced=reject --workspace
+        env:
+          # Set the path to the Fira Sans font for Typst.
+          TYPST_FONT_PATH: ${{ github.workspace }}/Fira-4.202/otf
 
   frontend-lint:
     name: Frontend / Lint
     runs-on: ubuntu-24.04
-    needs: changed-files
-    if: needs.changed-files.outputs.non-rust == 'true'
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.frontend-lint == 'true'
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
-          version: ${{ env.PNPM_VERSION }}
+          version: 11.15.1
 
-      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: pnpm
           node-version-file: package.json
 
       - run: pnpm install
 
-      - run: pnpm lint:hbs
       - run: pnpm lint:js
-      - run: pnpm lint:deps
       - run: pnpm prettier:check
-
-  frontend-test:
-    name: Frontend / Test
-    runs-on: ubuntu-24.04
-    needs: [changed-files, percy-nonce]
-    if: needs.changed-files.outputs.non-rust == 'true'
-
-    env:
-      JOBS: 1 # See https://git.io/vdao3 for details.
-
-      # Percy secrets are included here to enable Percy's GitHub integration
-      # on community-submitted PRs
-      PERCY_TOKEN: web_0a783d8086b6f996809f3e751d032dd6d156782082bcd1423b9b860113c75054
-      PERCY_PARALLEL_NONCE: ${{ needs.percy-nonce.outputs.nonce }}
-      PERCY_PARALLEL_TOTAL: 2
-
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
-        with:
-          cache: pnpm
-          node-version-file: package.json
-
-      - run: pnpm install
-
-      - if: github.repository == 'rust-lang/crates.io'
-        run: pnpm percy exec --parallel -- pnpm test-coverage
-
-      - if: github.repository != 'rust-lang/crates.io'
-        run: pnpm test-coverage
+      - run: pnpm --recursive --if-present run typecheck
 
   msw-test:
     name: Frontend / Test (@crates-io/msw)
     runs-on: ubuntu-24.04
-    needs: [changed-files]
-    if: needs.changed-files.outputs.non-rust == 'true'
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.msw-test == 'true'
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
-          version: ${{ env.PNPM_VERSION }}
+          version: 11.15.1
 
-      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: pnpm
           node-version-file: package.json
@@ -254,12 +206,36 @@ jobs:
 
       - run: pnpm --filter "@crates-io/msw" test
 
+  api-client-test:
+    name: Frontend / Test (@crates-io/api-client)
+    runs-on: ubuntu-24.04
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.api-client-test == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.15.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: pnpm
+          node-version-file: package.json
+
+      - run: pnpm install
+
+      - run: pnpm --filter "@crates-io/api-client" test
+
   e2e-test:
     name: Frontend / Test (playwright)
     runs-on: ubuntu-24.04
-    needs: [changed-files, percy-nonce]
+    needs: filter-jobs
     timeout-minutes: 60
-    if: needs.changed-files.outputs.non-rust == 'true'
+    if: needs.filter-jobs.outputs.e2e-test == 'true'
 
     env:
       JOBS: 1 # See https://git.io/vdao3 for details.
@@ -267,19 +243,18 @@ jobs:
       # Percy secrets are included here to enable Percy's GitHub integration
       # on community-submitted PRs
       PERCY_TOKEN: web_0a783d8086b6f996809f3e751d032dd6d156782082bcd1423b9b860113c75054
-      PERCY_PARALLEL_NONCE: ${{ needs.percy-nonce.outputs.nonce }}
-      PERCY_PARALLEL_TOTAL: 2
+      PERCY_CLIENT_ERROR_LOGS: 'false'
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
-          version: ${{ env.PNPM_VERSION }}
+          version: 11.15.1
 
-      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: pnpm
           node-version-file: package.json
@@ -288,12 +263,105 @@ jobs:
 
       - run: pnpm playwright install chromium
 
-      - if: github.repository == 'rust-lang/crates.io'
-        run: pnpm percy exec --parallel -- pnpm e2e
+      # Reuse the Chromium that Playwright just installed instead of letting
+      # @percy/core download its own.
+      - run: echo "PERCY_BROWSER_EXECUTABLE=$(node -e "console.log(require('@playwright/test').chromium.executablePath())")" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+      - if: github.repository == 'rust-lang/crates.io'
+        run: pnpm percy exec -- pnpm e2e:svelte
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: playwright-report
           path: playwright-report/
           retention-days: 14
+
+  zizmor:
+    name: CI / Lint
+    runs-on: ubuntu-24.04
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.zizmor == 'true'
+    permissions:
+      security-events: write # needed by `codeql-action/upload-sarif` to upload zizmor results to GitHub code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: zizmor
+
+      - run: zizmor --format=sarif . > results.sarif
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        with:
+          sarif_file: results.sarif
+          category: zizmor
+
+  svelte:
+    name: Frontend / Test
+    runs-on: ubuntu-24.04
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.svelte == 'true'
+
+    defaults:
+      run:
+        working-directory: svelte
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.15.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: pnpm
+          node-version-file: package.json
+
+      - run: pnpm install
+
+      - run: pnpm check
+      - run: pnpm build
+      - run: pnpm playwright install chromium-headless-shell
+      - run: pnpm test
+
+  svelte-chromatic:
+    name: Svelte / Chromatic
+    runs-on: ubuntu-24.04
+    needs: filter-jobs
+    if: needs.filter-jobs.outputs.svelte == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.15.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: pnpm
+          node-version-file: package.json
+
+      - run: pnpm install
+
+      # Chromatic token is included here to enable visual regression testing
+      # on community-submitted PRs
+      - uses: chromaui/action@94713c544284a14195de3b50ef24301579f1877e # v18.0.1
+        with:
+          workingDir: svelte
+          projectToken: chpt_015c1709eb9b9fa
+          autoAcceptChanges: main
+          exitZeroOnChanges: false

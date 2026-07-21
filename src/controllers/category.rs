@@ -2,13 +2,14 @@ use super::helpers::pagination::*;
 use crate::app::AppState;
 use crate::models::Category;
 use crate::schema::categories;
-use crate::util::errors::AppResult;
+use crate::util::errors::{AppResult, not_found};
 use crate::views::EncodableCategory;
 use axum::Json;
 use axum::extract::{FromRequestParts, Path, Query};
-use diesel::QueryDsl;
+use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use http::request::Parts;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, FromRequestParts, utoipa::IntoParams)]
 #[from_request(via(Query))]
@@ -56,17 +57,18 @@ pub async fn list_categories(
     // to paginate this.
     let options = PaginationOptions::builder().gather(&req)?;
 
-    let mut conn = app.db_read().await?;
+    let conn = app.db_read().await?;
 
     let sort = params.sort.as_ref().map_or("alpha", String::as_str);
 
     let offset = options.offset().unwrap_or_default();
 
-    let categories = Category::toplevel(&mut conn, sort, options.per_page, offset).await?;
-    let categories = categories.into_iter().map(Category::into).collect();
+    let (categories, total) = tokio::try_join!(
+        Category::toplevel(&conn, sort, options.per_page, offset),
+        Category::count_toplevel(&conn),
+    )?;
 
-    // Query for the total count of categories
-    let total = Category::count_toplevel(&mut conn).await?;
+    let categories = categories.into_iter().map(Category::into).collect();
 
     let meta = ListMeta { total };
     Ok(Json(ListResponse { categories, meta }))
@@ -91,21 +93,25 @@ pub async fn find_category(
     state: AppState,
     Path(slug): Path<String>,
 ) -> AppResult<Json<GetResponse>> {
+    // Category slugs can never contain null bytes, so we reject such requests
+    // early with a regular "not found" response instead of letting them reach
+    // the database layer, where PostgreSQL rejects the query with a confusing
+    // `invalid byte sequence for encoding "UTF8": 0x00` error.
+    if slug.contains('\0') {
+        return Err(not_found());
+    }
+
     let mut conn = state.db_read().await?;
 
-    let cat: Category = Category::by_slug(&slug).first(&mut conn).await?;
-    let subcats = cat
-        .subcategories(&mut conn)
-        .await?
-        .into_iter()
-        .map(Category::into)
-        .collect();
-    let parents = cat
-        .parent_categories(&mut conn)
-        .await?
-        .into_iter()
-        .map(Category::into)
-        .collect();
+    let cat: Category = Category::by_slug(&slug)
+        .select(Category::as_select())
+        .first(&mut conn)
+        .await?;
+    let (subcats, parents) =
+        tokio::try_join!(cat.subcategories(&conn), cat.parent_categories(&conn),)?;
+
+    let subcats = subcats.into_iter().map(Category::into).collect();
+    let parents = parents.into_iter().map(Category::into).collect();
 
     let mut category = EncodableCategory::from(cat);
     category.subcategories = Some(subcats);

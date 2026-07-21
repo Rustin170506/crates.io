@@ -1,13 +1,11 @@
-use crate::rate_limiter::LimitedAction;
-use crate::schema::{publish_limit_buckets, publish_rate_overrides};
-use crate::tests::builders::PublishBuilder;
-use crate::tests::util::{RequestHelper, TestApp};
+use crate::builders::PublishBuilder;
+use crate::util::{RequestHelper, TestApp};
 use chrono::{DateTime, Utc};
+use crates_io::rate_limiter::LimitedAction;
+use crates_io::schema::{publish_limit_buckets, publish_rate_overrides};
 use diesel::ExpressionMethods;
 use diesel_async::RunQueryDsl;
-use http::StatusCode;
 use insta::assert_snapshot;
-use std::thread;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -43,7 +41,7 @@ async fn publish_new_crate_ratelimit_hit() {
     assert_eq!(app.stored_files().await.len(), 0);
 
     let response = anon.get::<()>("/api/v1/crates/rate_limited").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -73,8 +71,10 @@ async fn publish_new_crate_ratelimit_expires() {
     let crate_to_publish = PublishBuilder::new("rate_limited", "1.0.0");
     token.publish_crate(crate_to_publish).await.good();
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited/rate_limited-1.0.0.crate
+    crates/rate_limited/rate_limited-1.0.0.zip
+    crates/rate_limited/rate_limited-1.0.0.zip.json
     index/ra/te/rate_limited
     rss/crates.xml
     rss/crates/rate_limited.xml
@@ -114,8 +114,10 @@ async fn publish_new_crate_override_loosens_ratelimit() {
     let crate_to_publish = PublishBuilder::new("rate_limited1", "1.0.0");
     token.publish_crate(crate_to_publish).await.good();
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml
@@ -128,9 +130,13 @@ async fn publish_new_crate_override_loosens_ratelimit() {
     let crate_to_publish = PublishBuilder::new("rate_limited2", "1.0.0");
     token.publish_crate(crate_to_publish).await.good();
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     crates/rate_limited2/rate_limited2-1.0.0.crate
+    crates/rate_limited2/rate_limited2-1.0.0.zip
+    crates/rate_limited2/rate_limited2-1.0.0.zip.json
     index/ra/te/rate_limited1
     index/ra/te/rate_limited2
     rss/crates.xml
@@ -148,9 +154,13 @@ async fn publish_new_crate_override_loosens_ratelimit() {
         .await
         .assert_rate_limited(LimitedAction::PublishNew);
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     crates/rate_limited2/rate_limited2-1.0.0.crate
+    crates/rate_limited2/rate_limited2-1.0.0.zip
+    crates/rate_limited2/rate_limited2-1.0.0.zip.json
     index/ra/te/rate_limited1
     index/ra/te/rate_limited2
     rss/crates.xml
@@ -160,7 +170,7 @@ async fn publish_new_crate_override_loosens_ratelimit() {
     ");
 
     let response = anon.get::<()>("/api/v1/crates/rate_limited3").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -193,8 +203,10 @@ async fn publish_new_crate_expired_override_ignored() {
     let crate_to_publish = PublishBuilder::new("rate_limited1", "1.0.0");
     token.publish_crate(crate_to_publish).await.good();
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml
@@ -210,8 +222,10 @@ async fn publish_new_crate_expired_override_ignored() {
         .await
         .assert_rate_limited(LimitedAction::PublishNew);
 
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml
@@ -219,7 +233,7 @@ async fn publish_new_crate_expired_override_ignored() {
     ");
 
     let response = anon.get::<()>("/api/v1/crates/rate_limited2").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_snapshot!(response.status(), @"404 Not Found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -239,7 +253,7 @@ async fn publish_new_crate_rate_limit_doesnt_affect_existing_crates() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_existing_crate_rate_limited() {
-    const RATE_LIMIT: Duration = Duration::from_millis(1000);
+    const RATE_LIMIT: Duration = Duration::from_secs(60);
 
     let (app, anon, _, token) = TestApp::full()
         .with_rate_limit(LimitedAction::PublishUpdate, RATE_LIMIT, 1)
@@ -252,8 +266,10 @@ async fn publish_existing_crate_rate_limited() {
 
     let json = anon.show_crate("rate_limited1").await;
     assert_eq!(json.krate.max_version, "1.0.0");
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml
@@ -266,9 +282,13 @@ async fn publish_existing_crate_rate_limited() {
 
     let json = anon.show_crate("rate_limited1").await;
     assert_eq!(json.krate.max_version, "1.0.1");
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     crates/rate_limited1/rate_limited1-1.0.1.crate
+    crates/rate_limited1/rate_limited1-1.0.1.zip
+    crates/rate_limited1/rate_limited1-1.0.1.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml
@@ -285,27 +305,46 @@ async fn publish_existing_crate_rate_limited() {
     // Check that  version 1.0.2 was not published
     let json = anon.show_crate("rate_limited1").await;
     assert_eq!(json.krate.max_version, "1.0.1");
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     crates/rate_limited1/rate_limited1-1.0.1.crate
+    crates/rate_limited1/rate_limited1-1.0.1.zip
+    crates/rate_limited1/rate_limited1-1.0.1.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml
     rss/updates.xml
     ");
 
-    // Wait for the limit to be up
-    thread::sleep(RATE_LIMIT);
+    // Reset the rate limit by updating the database timestamp
+    let mut conn = app.db_conn().await;
+    let past_time = Utc::now().naive_utc() - RATE_LIMIT - Duration::from_secs(10);
+
+    diesel::update(publish_limit_buckets::table)
+        .filter(publish_limit_buckets::user_id.eq(token.as_model().user_id))
+        .filter(publish_limit_buckets::action.eq(LimitedAction::PublishUpdate))
+        .set(publish_limit_buckets::last_refill.eq(past_time))
+        .execute(&mut conn)
+        .await
+        .expect("Failed to reset rate limit");
 
     let crate_to_publish = PublishBuilder::new("rate_limited1", "1.0.2");
     token.publish_crate(crate_to_publish).await.good();
 
     let json = anon.show_crate("rate_limited1").await;
     assert_eq!(json.krate.max_version, "1.0.2");
-    assert_snapshot!(app.stored_files().await.join("\n"), @r"
+    assert_snapshot!(app.stored_files().await.join("\n"), @"
     crates/rate_limited1/rate_limited1-1.0.0.crate
+    crates/rate_limited1/rate_limited1-1.0.0.zip
+    crates/rate_limited1/rate_limited1-1.0.0.zip.json
     crates/rate_limited1/rate_limited1-1.0.1.crate
+    crates/rate_limited1/rate_limited1-1.0.1.zip
+    crates/rate_limited1/rate_limited1-1.0.1.zip.json
     crates/rate_limited1/rate_limited1-1.0.2.crate
+    crates/rate_limited1/rate_limited1-1.0.2.zip
+    crates/rate_limited1/rate_limited1-1.0.2.zip.json
     index/ra/te/rate_limited1
     rss/crates.xml
     rss/crates/rate_limited1.xml

@@ -14,8 +14,8 @@ use crate::config;
 pub async fn oneoff_connection_with_config(
     config: &config::DatabasePools,
 ) -> ConnectionResult<AsyncPgConnection> {
-    let url = connection_url(config, config.primary.url.expose_secret());
-    establish_async_connection(&url, config.enforce_tls).await
+    let url = connection_url(&config.primary);
+    establish_async_connection(&url, config.primary.enforce_tls).await
 }
 
 pub async fn oneoff_connection() -> anyhow::Result<AsyncPgConnection> {
@@ -23,8 +23,8 @@ pub async fn oneoff_connection() -> anyhow::Result<AsyncPgConnection> {
     Ok(oneoff_connection_with_config(&config).await?)
 }
 
-pub fn connection_url(config: &config::DatabasePools, url: &str) -> String {
-    let mut url = Url::parse(url).expect("Invalid database URL");
+pub fn connection_url(config: &config::DbPoolConfig) -> String {
+    let mut url = Url::parse(config.url.expose_secret()).expect("Invalid database URL");
 
     if config.enforce_tls {
         maybe_append_url_param(&mut url, "sslmode", "require");
@@ -35,7 +35,7 @@ pub fn connection_url(config: &config::DatabasePools, url: &str) -> String {
     maybe_append_url_param(
         &mut url,
         "tcp_user_timeout",
-        &config.tcp_timeout_ms.to_string(),
+        &config.tcp_timeout.as_millis().to_string(),
     );
 
     url.into()
@@ -47,8 +47,8 @@ fn maybe_append_url_param(url: &mut Url, key: &str, value: &str) {
     }
 }
 
-/// Create a new [ManagerConfig] for the database connection pool, which can
-/// be used with [diesel_async::pooled_connection::AsyncDieselConnectionManager::new_with_config()].
+/// Creates a new [`ManagerConfig`] for the database connection pool, which can
+/// be used with [`diesel_async::pooled_connection::AsyncDieselConnectionManager::new_with_config()`].
 pub fn make_manager_config(enforce_tls: bool) -> ManagerConfig<AsyncPgConnection> {
     let mut manager_config = ManagerConfig::default();
     manager_config.custom_setup =
@@ -56,7 +56,7 @@ pub fn make_manager_config(enforce_tls: bool) -> ManagerConfig<AsyncPgConnection
     manager_config
 }
 
-/// Establish a new database connection with the given URL.
+/// Establishes a new database connection with the given URL.
 ///
 /// Adapted from <https://github.com/weiznich/diesel_async/blob/v0.5.0/examples/postgres/pooled-with-rustls/src/main.rs>.
 async fn establish_async_connection(

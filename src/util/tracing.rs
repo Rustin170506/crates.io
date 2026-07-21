@@ -1,7 +1,6 @@
 use crates_io_env_vars::var;
 use sentry::integrations::tracing::EventFilter;
-use tracing::Level;
-use tracing::Metadata;
+use tracing::{Level, Metadata, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, prelude::*};
 
@@ -54,7 +53,7 @@ fn init_with_default_level(level: LevelFilter) {
 pub fn event_filter(metadata: &Metadata<'_>) -> EventFilter {
     match metadata.level() {
         &Level::ERROR if metadata.target() == "http" => EventFilter::Breadcrumb,
-        &Level::ERROR => EventFilter::Exception,
+        &Level::ERROR => EventFilter::Event,
         &Level::WARN | &Level::INFO => EventFilter::Breadcrumb,
         &Level::DEBUG | &Level::TRACE => EventFilter::Ignore,
     }

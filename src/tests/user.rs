@@ -1,22 +1,25 @@
-use crate::controllers::session;
-use crate::models::{ApiToken, Email, User};
-use crate::tests::TestApp;
-use crate::tests::util::github::next_gh_id;
-use crate::tests::util::{MockCookieUser, RequestHelper};
-use crate::util::token::HashedToken;
+use crate::TestApp;
+use crate::util::github::next_gh_id;
+use crate::util::{MockCookieUser, RequestHelper};
 use chrono::{DateTime, Utc};
-use crates_io_github::GithubUser;
+use claims::{assert_err, assert_ok, assert_ok_eq};
+use crates_io::controllers::session;
+use crates_io::models::{ApiToken, Email, OauthGithub, User};
+use crates_io::schema::oauth_github;
+use crates_io::util::token::HashedToken;
+use crates_io_encryption::TokenEncryption;
+use crates_io_github::GitHubUser;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use http::StatusCode;
+use insta::assert_snapshot;
 use secrecy::ExposeSecret;
 use serde_json::json;
 
-impl crate::tests::util::MockCookieUser {
+impl crate::util::MockCookieUser {
     async fn confirm_email(&self, email_token: &str) {
         let url = format!("/api/v1/confirm/{email_token}");
         let response = self.put::<()>(&url, &[] as &[u8]).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_snapshot!(response.status(), @"200 OK");
         assert_eq!(response.json(), json!({ "ok": true }));
     }
 }
@@ -29,23 +32,27 @@ async fn updating_existing_user_doesnt_change_api_token() -> anyhow::Result<()> 
     let gh_id = user.as_model().gh_id;
     let token = token.plaintext();
 
+    let encryption = TokenEncryption::for_testing();
+
     // Reuse gh_id but use new gh_login and gh_access_token
-    let gh_user = GithubUser {
+    let gh_user = GitHubUser {
         id: gh_id,
         login: "bar".to_string(),
         name: None,
         email: None,
         avatar_url: None,
     };
-    assert_ok!(session::save_user_to_database(&gh_user, "bar_token", emails, &mut conn).await);
+    let encrypted_token = encryption.encrypt("bar_token")?;
+    assert_ok!(session::save_user_to_database(&gh_user, &encrypted_token, emails, &mut conn).await);
 
     // Use the original API token to find the now updated user
-    let hashed_token = assert_ok!(HashedToken::parse(token.expose_secret()));
+    let hashed_token = assert_ok!(HashedToken::parse(token));
     let api_token = assert_ok!(ApiToken::find_by_api_token(&mut conn, &hashed_token).await);
-    let user = assert_ok!(User::find(&mut conn, api_token.user_id).await);
+    let user = assert_ok!(User::find(&conn, api_token.user_id).await);
 
     assert_eq!(user.gh_login, "bar");
-    assert_eq!(user.gh_access_token.expose_secret(), "bar_token");
+    let decrypted_token = encryption.decrypt(&user.gh_encrypted_token)?;
+    assert_eq!(decrypted_token.expose_secret(), "bar_token");
 
     Ok(())
 }
@@ -67,10 +74,10 @@ async fn github_without_email_does_not_overwrite_email() -> anyhow::Result<()> {
 
     // Simulate logging in via GitHub with an account that has no email.
 
-    // Because faking GitHub is terrible, call what GithubUser::save_to_database does directly.
+    // Because faking GitHub is terrible, call what GitHubUser::save_to_database does directly.
     // Don't use app.db_new_user because it adds a verified email.
     let gh_id = next_gh_id();
-    let gh_user = GithubUser {
+    let gh_user = GitHubUser {
         id: gh_id,
         login: "arbitrary_username".to_string(),
         name: None,
@@ -78,8 +85,8 @@ async fn github_without_email_does_not_overwrite_email() -> anyhow::Result<()> {
         avatar_url: None,
     };
 
-    let u =
-        session::save_user_to_database(&gh_user, "some random token", emails, &mut conn).await?;
+    let user_id = session::save_user_to_database(&gh_user, &[], emails, &mut conn).await?;
+    let u = User::find(&conn, user_id).await?;
 
     let user_without_github_email = MockCookieUser::new(&app, u);
 
@@ -94,7 +101,7 @@ async fn github_without_email_does_not_overwrite_email() -> anyhow::Result<()> {
 
     // Simulate the same user logging in via GitHub again, still with no email in GitHub.
 
-    let gh_user = GithubUser {
+    let gh_user = GitHubUser {
         id: gh_id,
         login: "arbitrary_username".to_string(),
         name: None,
@@ -102,8 +109,8 @@ async fn github_without_email_does_not_overwrite_email() -> anyhow::Result<()> {
         avatar_url: None,
     };
 
-    let u =
-        session::save_user_to_database(&gh_user, "some random token", emails, &mut conn).await?;
+    let user_id = session::save_user_to_database(&gh_user, &[], emails, &mut conn).await?;
+    let u = User::find(&conn, user_id).await?;
 
     let again_user_without_github_email = MockCookieUser::new(&app, u);
 
@@ -117,7 +124,7 @@ async fn github_without_email_does_not_overwrite_email() -> anyhow::Result<()> {
 /// sign in again, that the email in crates.io will remain set to the original email used on GitHub.
 #[tokio::test(flavor = "multi_thread")]
 async fn github_with_email_does_not_overwrite_email() -> anyhow::Result<()> {
-    use crate::schema::emails;
+    use crates_io::schema::emails;
 
     let (app, _, user) = TestApp::init().with_user().await;
     let mut conn = app.db_conn().await;
@@ -135,7 +142,7 @@ async fn github_with_email_does_not_overwrite_email() -> anyhow::Result<()> {
 
     let emails = app.as_inner().emails.clone();
 
-    let gh_user = GithubUser {
+    let gh_user = GitHubUser {
         // Use the same github ID to link to the existing account
         id: model.gh_id,
         login: "arbitrary_username".to_string(),
@@ -144,8 +151,8 @@ async fn github_with_email_does_not_overwrite_email() -> anyhow::Result<()> {
         avatar_url: None,
     };
 
-    let u =
-        session::save_user_to_database(&gh_user, "some random token", &emails, &mut conn).await?;
+    let user_id = session::save_user_to_database(&gh_user, &[], &emails, &mut conn).await?;
+    let u = User::find(&conn, user_id).await?;
 
     let user_with_different_email_in_github = MockCookieUser::new(&app, u);
 
@@ -156,8 +163,8 @@ async fn github_with_email_does_not_overwrite_email() -> anyhow::Result<()> {
 }
 
 /// Given a crates.io user, check that the user's email can be
-/// updated in the database (PUT /user/{user_id}), then check
-/// that the updated email is sent back to the user (GET /me).
+/// updated in the database (`PUT /user/{user_id}`), then check
+/// that the updated email is sent back to the user (`GET /me`).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_email_get_and_put() -> anyhow::Result<()> {
     let (_app, _anon, user) = TestApp::init().with_user().await;
@@ -177,12 +184,12 @@ async fn test_email_get_and_put() -> anyhow::Result<()> {
 
 /// Given a new user, test that their email can be added
 /// to the email table and a token for the email is generated
-/// and added to the token table. When /confirm/{email_token} is
+/// and added to the token table. When `/confirm/{email_token}` is
 /// requested, check that the response back is ok, and that
-/// the email_verified field on user is now set to true.
+/// the `email_verified` field on user is now set to true.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_confirm_user_email() -> anyhow::Result<()> {
-    use crate::schema::emails;
+    use crates_io::schema::emails;
 
     let (app, _) = TestApp::init().empty().await;
     let mut conn = app.db_conn().await;
@@ -193,7 +200,7 @@ async fn test_confirm_user_email() -> anyhow::Result<()> {
 
     let emails = &app.as_inner().emails;
 
-    let gh_user = GithubUser {
+    let gh_user = GitHubUser {
         id: next_gh_id(),
         login: "arbitrary_username".to_string(),
         name: None,
@@ -201,8 +208,8 @@ async fn test_confirm_user_email() -> anyhow::Result<()> {
         avatar_url: None,
     };
 
-    let u =
-        session::save_user_to_database(&gh_user, "some random token", emails, &mut conn).await?;
+    let user_id = session::save_user_to_database(&gh_user, &[], emails, &mut conn).await?;
+    let u = User::find(&conn, user_id).await?;
 
     let user = MockCookieUser::new(&app, u);
     let user_model = user.as_model();
@@ -227,7 +234,7 @@ async fn test_confirm_user_email() -> anyhow::Result<()> {
 /// make the user think we've sent an email when we haven't.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_existing_user_email() -> anyhow::Result<()> {
-    use crate::schema::emails;
+    use crates_io::schema::emails;
     use diesel::update;
 
     let (app, _) = TestApp::init().empty().await;
@@ -239,7 +246,7 @@ async fn test_existing_user_email() -> anyhow::Result<()> {
 
     let emails = &app.as_inner().emails;
 
-    let gh_user = GithubUser {
+    let gh_user = GitHubUser {
         id: next_gh_id(),
         login: "arbitrary_username".to_string(),
         name: None,
@@ -247,8 +254,8 @@ async fn test_existing_user_email() -> anyhow::Result<()> {
         avatar_url: None,
     };
 
-    let u =
-        session::save_user_to_database(&gh_user, "some random token", emails, &mut conn).await?;
+    let user_id = session::save_user_to_database(&gh_user, &[], emails, &mut conn).await?;
+    let u = User::find(&conn, user_id).await?;
 
     update(Email::belonging_to(&u))
         // Users created before we added verification will have
@@ -262,6 +269,210 @@ async fn test_existing_user_email() -> anyhow::Result<()> {
     assert_eq!(json.user.email.unwrap(), "potahto@example.com");
     assert!(!json.user.email_verified);
     assert!(!json.user.email_verification_sent);
+
+    Ok(())
+}
+
+// To assist in the transition from `users.gh_login` to `users.username`, also write the
+// `GitHubUser`'s `login` to `users.username`.
+#[tokio::test(flavor = "multi_thread")]
+async fn also_write_to_users_username() -> anyhow::Result<()> {
+    let (app, _) = TestApp::init().empty().await;
+    let mut conn = app.db_conn().await;
+    let encryption = TokenEncryption::for_testing();
+    let gh_id = next_gh_id();
+    let email = "potahto@example.com";
+    let emails = &app.as_inner().emails;
+
+    // Simulate logging in via GitHub. Don't use app.db_new_user because it inserts a user record
+    // directly into the database and we want to test the OAuth flow here.
+    let gh_user = GitHubUser {
+        id: gh_id,
+        login: "arbitrary_username".to_string(),
+        name: None,
+        email: Some(email.to_string()),
+        avatar_url: None,
+    };
+    let encrypted_token = encryption.encrypt("some random token")?;
+    let uid = session::save_user_to_database(&gh_user, &encrypted_token, emails, &mut conn).await?;
+    let u = User::find(&conn, uid).await?;
+
+    assert_eq!(u.username, "arbitrary_username");
+
+    Ok(())
+}
+
+// To assist in eventually someday allowing OAuth with more than GitHub, verify that we're writing
+// the GitHub info to both the `users` and `oauth_github` tables.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_users_and_oauth_github() -> anyhow::Result<()> {
+    let (app, _) = TestApp::init().empty().await;
+    let mut conn = app.db_conn().await;
+    let encryption = TokenEncryption::for_testing();
+    let gh_id = next_gh_id();
+    let gh_login = "arbitrary_username".to_string();
+    let gh_display_name = "Arbitrary Username".to_string();
+    let gh_avatar = "http://example.com/icon-the-first.png".to_string();
+    let gh_token = "some random token";
+    let email = "potahto@example.com";
+    let emails = &app.as_inner().emails;
+
+    // Simulate logging in via GitHub. Don't use app.db_new_user because it inserts a user record
+    // directly into the database and we want to test the OAuth flow here.
+    let gh_user = GitHubUser {
+        id: gh_id,
+        login: gh_login.clone(),
+        name: Some(gh_display_name.clone()),
+        email: Some(email.to_string()),
+        avatar_url: Some(gh_avatar.clone()),
+    };
+    let encrypted_token = encryption.encrypt(gh_token)?;
+    let uid = session::save_user_to_database(&gh_user, &encrypted_token, emails, &mut conn).await?;
+    let u = User::find(&conn, uid).await?;
+    assert_eq!(u.username, gh_login);
+    assert_eq!(u.name.unwrap(), gh_display_name);
+    assert_eq!(u.gh_id, gh_id);
+    assert_eq!(u.gh_login, gh_login);
+    assert_eq!(u.gh_avatar.unwrap(), gh_avatar);
+    let decrypted_token = encryption.decrypt(&u.gh_encrypted_token)?;
+    assert_eq!(decrypted_token.expose_secret(), gh_token);
+
+    let oauth_github_records: Vec<OauthGithub> = oauth_github::table.load(&mut conn).await.unwrap();
+    assert_eq!(oauth_github_records.len(), 1);
+    let oauth_github = &oauth_github_records[0];
+    assert_eq!(oauth_github.user_id, u.id);
+    assert_eq!(oauth_github.account_id, gh_id as i64);
+    assert_eq!(oauth_github.login, gh_login);
+    assert_eq!(oauth_github.avatar.as_ref().unwrap(), &gh_avatar);
+    let decrypted_token = encryption.decrypt(&oauth_github.encrypted_token)?;
+    assert_eq!(decrypted_token.expose_secret(), gh_token);
+
+    // Log in again with the same gh_id but different login, avatar, and token; these should get
+    // updated in both the `users` and `oauth_github` tables.
+    let different_gh_login = "i_changed_my_username".to_string();
+    let different_gh_display_name = "Someone Else".to_string();
+    let different_gh_avatar = "http://example.com/icon-the-second.png".to_string();
+    let different_gh_token = "a different token";
+    let gh_user = GitHubUser {
+        id: gh_id,
+        login: different_gh_login.clone(),
+        name: Some(different_gh_display_name.clone()),
+        email: Some(email.to_string()),
+        avatar_url: Some(different_gh_avatar.clone()),
+    };
+    let encrypted_token = encryption.encrypt(different_gh_token)?;
+    let uid = session::save_user_to_database(&gh_user, &encrypted_token, emails, &mut conn).await?;
+    let u = User::find(&conn, uid).await?;
+    assert_eq!(u.username, different_gh_login);
+    assert_eq!(u.name.unwrap(), different_gh_display_name);
+    assert_eq!(u.gh_id, gh_id);
+    assert_eq!(u.gh_login, different_gh_login);
+    assert_eq!(u.gh_avatar.unwrap(), different_gh_avatar);
+    let decrypted_token = encryption.decrypt(&u.gh_encrypted_token)?;
+    assert_eq!(decrypted_token.expose_secret(), different_gh_token);
+
+    let oauth_github_records: Vec<OauthGithub> = oauth_github::table.load(&mut conn).await.unwrap();
+    // There still should only be one `oauth_github` record that got updated, not a new insertion
+    assert_eq!(oauth_github_records.len(), 1);
+    let oauth_github = &oauth_github_records[0];
+    assert_eq!(oauth_github.user_id, u.id);
+    assert_eq!(oauth_github.login, different_gh_login);
+    assert_eq!(oauth_github.avatar.as_ref().unwrap(), &different_gh_avatar,);
+    let decrypted_token = encryption.decrypt(&oauth_github.encrypted_token)?;
+    assert_eq!(decrypted_token.expose_secret(), different_gh_token);
+
+    // Now that the user has renamed their account on GitHub, someone else can claim it and log in
+    // to crates.io with it (with a different GitHub ID)
+    let new_gh_id = gh_id + 1;
+    let gh_user = GitHubUser {
+        id: new_gh_id,
+        login: gh_login.clone(),
+        name: None,
+        email: Some(email.to_string()),
+        avatar_url: None,
+    };
+    let another_gh_token = "a different random token";
+    let encrypted_token = encryption.encrypt(another_gh_token)?;
+    let uid = session::save_user_to_database(&gh_user, &encrypted_token, emails, &mut conn).await?;
+    let u = User::find(&conn, uid).await?;
+
+    assert_eq!(u.gh_login, gh_login);
+    assert_eq!(u.gh_id, new_gh_id);
+
+    let oauth_github_records: Vec<OauthGithub> = oauth_github::table.load(&mut conn).await.unwrap();
+    assert_eq!(oauth_github_records.len(), 2);
+    let additional_user_oauth_github = oauth_github_records
+        .iter()
+        .find(|gh| *gh.id() == new_gh_id as i64)
+        .unwrap();
+
+    assert_eq!(additional_user_oauth_github.user_id, u.id);
+    assert_eq!(additional_user_oauth_github.account_id, new_gh_id as i64);
+    assert_eq!(additional_user_oauth_github.login, gh_login);
+    assert!(additional_user_oauth_github.avatar.is_none());
+    let decrypted_token = encryption.decrypt(&additional_user_oauth_github.encrypted_token)?;
+    assert_eq!(decrypted_token.expose_secret(), another_gh_token);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_user_can_log_in_during_read_only_mode() -> anyhow::Result<()> {
+    let (app, _) = TestApp::init().empty().await;
+    let mut conn = app.db_conn().await;
+    let emails = &app.as_inner().emails;
+
+    let gh_user = GitHubUser {
+        id: next_gh_id(),
+        login: "github_user".to_string(),
+        name: Some("My Name".to_string()),
+        email: None,
+        avatar_url: None,
+    };
+
+    // Create the user and its `oauth_github` record while the database is writable.
+    let user_id = session::save_user_to_database(&gh_user, b"token", emails, &mut conn).await?;
+
+    // Switch the connection into read-only mode, mirroring how the app configures
+    // read-only connections in `ConnectionConfig::apply()`.
+    diesel::sql_query("SET default_transaction_read_only = 't'")
+        .execute(&mut conn)
+        .await?;
+
+    // Logging in again as an existing user must still succeed by falling back to a lookup, even
+    // though the write attempts fail in read-only mode.
+    let result = session::save_user_to_database(&gh_user, b"token", emails, &mut conn).await;
+
+    assert_ok_eq!(result, user_id);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_user_cannot_log_in_during_read_only_mode() -> anyhow::Result<()> {
+    let (app, _) = TestApp::init().empty().await;
+    let mut conn = app.db_conn().await;
+    let emails = &app.as_inner().emails;
+
+    let gh_user = GitHubUser {
+        id: next_gh_id(),
+        login: "github_user".to_string(),
+        name: Some("My Name".to_string()),
+        email: None,
+        avatar_url: None,
+    };
+
+    // Switch the connection into read-only mode, mirroring how the app configures
+    // read-only connections in `ConnectionConfig::apply()`.
+    diesel::sql_query("SET default_transaction_read_only = 't'")
+        .execute(&mut conn)
+        .await?;
+
+    // Logging in as a new user can't work in read-only mode.
+    let result = session::save_user_to_database(&gh_user, b"token", emails, &mut conn).await;
+
+    let error = assert_err!(result);
+    assert_snapshot!(error, @"cannot execute UPDATE in a read-only transaction");
 
     Ok(())
 }

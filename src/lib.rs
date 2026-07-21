@@ -1,20 +1,10 @@
 //! This crate implements the backend server for <https://crates.io/>
 //!
-//! All implemented routes are defined in the [middleware](fn.middleware.html) function and
-//! implemented in the [category](category/index.html), [keyword](keyword/index.html),
-//! [krate](krate/index.html), [user](user/index.html) and [version](version/index.html) modules.
-
-#[cfg(test)]
-#[macro_use]
-extern crate claims;
-#[macro_use]
-extern crate diesel;
-#[macro_use]
-extern crate serde;
-#[macro_use]
-extern crate tracing;
+//! All implemented routes are defined in the [`router`] module and implemented
+//! in the [`controllers`] module.
 
 pub use crate::{app::App, email::Emails};
+pub use crates_io_api_types as views;
 pub use crates_io_database::{models, schema};
 use std::sync::Arc;
 
@@ -25,7 +15,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-mod app;
+pub mod app;
 pub mod auth;
 pub mod boot;
 pub mod certs;
@@ -34,8 +24,6 @@ pub mod config;
 pub mod controllers;
 pub mod db;
 pub mod email;
-pub mod external_urls;
-pub mod fastly;
 pub mod headers;
 pub mod index;
 mod licenses;
@@ -43,26 +31,22 @@ pub mod metrics;
 pub mod middleware;
 pub mod openapi;
 pub mod rate_limiter;
-mod real_ip;
 mod router;
 pub mod sentry;
 pub mod sqs;
 pub mod ssh;
 pub mod storage;
 pub mod tasks;
-#[cfg(test)]
-pub mod tests;
 pub mod typosquat;
 pub mod util;
-pub mod views;
 pub mod worker;
 
 /// Used for setting different values depending on whether the app is being run in production,
 /// in development, or for testing.
 ///
-/// The app's `config.env` value is set in *src/bin/server.rs* to `Production` if the environment
-/// variable `HEROKU` is set and `Development` otherwise. `config.env` is set to `Test`
-/// unconditionally in *src/test/all.rs*.
+/// The app's `config.env` value is set by [`Base::from_environment()`](crate::config::Base::from_environment)
+/// to `Production` if the environment variable `HEROKU` is set and `Development` otherwise. It is
+/// set to `Test` unconditionally by the test harness.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Env {
     Development,

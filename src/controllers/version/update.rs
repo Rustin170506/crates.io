@@ -15,7 +15,8 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use http::StatusCode;
 use http::request::Parts;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Deserialize)]
 pub struct VersionUpdate {
@@ -53,7 +54,7 @@ pub async fn update_version(
     Json(update_request): Json<VersionUpdateRequest>,
 ) -> AppResult<Json<UpdateResponse>> {
     let mut conn = state.db_write().await?;
-    let (mut version, krate) = path.load_version_and_crate(&mut conn).await?;
+    let (mut version, krate) = path.load_version_and_crate(&conn).await?;
     validate_yank_update(&update_request.version, &version)?;
     let auth = authenticate(&req, &mut conn, &krate.name).await?;
 
@@ -74,8 +75,8 @@ pub async fn update_version(
     .await?;
 
     let (actions, published_by) = tokio::try_join!(
-        VersionOwnerAction::by_version(&mut conn, &version),
-        version.published_by(&mut conn),
+        VersionOwnerAction::by_version(&conn, &version),
+        version.published_by(&conn),
     )?;
     let version = EncodableVersion::from(version, &krate.name, published_by, actions);
     Ok(Json(UpdateResponse { version }))
@@ -124,7 +125,8 @@ pub async fn perform_version_yank_update(
 
     let yanked = yanked.unwrap_or(version.yanked);
 
-    if Rights::get(user, &*state.github, &owners).await? < Rights::Publish {
+    let encryption = &state.config.token_encryption;
+    if Rights::get(user, &*state.github, &owners, encryption).await? < Rights::Publish {
         if user.is_admin {
             let action = if yanked { "yanking" } else { "unyanking" };
             warn!(
@@ -177,14 +179,21 @@ pub async fn perform_version_yank_update(
         .insert(conn)
         .await?;
 
-    let git_index_job = SyncToGitIndex::new(&krate.name);
+    let sync_git_index = async {
+        if state.config.sync_git_index {
+            let git_index_job = SyncToGitIndex::new(&krate.name);
+            git_index_job.enqueue(&*conn).await?;
+        }
+        Ok(())
+    };
+
     let sparse_index_job = SyncToSparseIndex::new(&krate.name);
     let update_default_version_job = UpdateDefaultVersion::new(krate.id);
 
     tokio::try_join!(
-        git_index_job.enqueue(conn),
-        sparse_index_job.enqueue(conn),
-        update_default_version_job.enqueue(conn),
+        sync_git_index,
+        sparse_index_job.enqueue(&*conn),
+        update_default_version_job.enqueue(&*conn),
     )?;
 
     Ok(())

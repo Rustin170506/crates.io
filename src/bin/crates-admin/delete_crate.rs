@@ -2,6 +2,7 @@ use crate::dialoguer;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
+use crates_io::controllers::krate::delete::max_downloads;
 use crates_io::models::{NewDeletedCrate, User};
 use crates_io::schema::{crate_downloads, deleted_crates};
 use crates_io::worker::jobs;
@@ -12,7 +13,6 @@ use diesel::dsl::{count_star, sql};
 use diesel::expression::SqlLiteral;
 use diesel::prelude::*;
 use diesel::sql_types::{Array, Text};
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use std::fmt::Display;
 
@@ -53,15 +53,13 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
     let mut crate_names = opts.crate_names;
     crate_names.sort();
 
-    let existing_crates = crates::table
-        .inner_join(crate_downloads::table)
+    let existing_crates = CrateInfo::query()
         .filter(crates::name.eq_any(&crate_names))
-        .select(CrateInfo::as_select())
-        .load::<CrateInfo>(&mut conn)
+        .load(&mut conn)
         .await
         .context("Failed to look up crate name from the database")?;
 
-    let deleted_by = User::find_by_login(&mut conn, &opts.deleted_by)
+    let deleted_by = User::find_by_login(&conn, &opts.deleted_by)
         .await
         .context("Failed to look up `--deleted-by` user from the database")?;
 
@@ -96,7 +94,7 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
 
             info!("{name}: Deleting crate from the database…");
             let result = conn
-                .transaction(|conn| delete_from_database(conn, id, deleted_crate).scope_boxed())
+                .transaction(async |conn| delete_from_database(conn, id, deleted_crate).await)
                 .await;
 
             if let Err(error) = result {
@@ -112,9 +110,9 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         let delete_from_storage_job = jobs::DeleteCrateFromStorage::new(name.into());
 
         if let Err(error) = tokio::try_join!(
-            git_index_job.enqueue(&mut conn),
-            sparse_index_job.enqueue(&mut conn),
-            delete_from_storage_job.enqueue(&mut conn),
+            git_index_job.enqueue(&conn),
+            sparse_index_job.enqueue(&conn),
+            delete_from_storage_job.enqueue(&conn),
         ) {
             warn!("{name}: Failed to enqueue background job: {error}");
         }
@@ -140,8 +138,11 @@ async fn delete_from_database(
     Ok(())
 }
 
-#[derive(Debug, Clone, Queryable, Selectable)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone, HasQuery)]
+#[diesel(
+    base_query = crates::table
+        .inner_join(crate_downloads::table)
+)]
 struct CrateInfo {
     #[diesel(select_expression = crates::columns::name)]
     name: String,
@@ -163,10 +164,14 @@ impl Display for CrateInfo {
         let owners = self.owners.join(", ");
 
         write!(f, "id={id}, owners={owners}")?;
-        if self.downloads > 5000 {
-            let downloads = format!("downloads={}", self.downloads).bright_red().bold();
-            write!(f, ", {downloads}")?;
+
+        let mut downloads = format!("downloads={}", self.downloads);
+        let age = Utc::now().signed_duration_since(self.created_at);
+        if self.downloads as u64 > max_downloads(&age) {
+            downloads.push_str("🚨🚨🚨");
         }
+        write!(f, ", {downloads}")?;
+
         if self.rev_deps > 0 {
             let rev_deps = format!("rev_deps={}", self.rev_deps).bright_red().bold();
             write!(f, ", {rev_deps}")?;
