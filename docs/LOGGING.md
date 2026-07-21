@@ -1,4 +1,4 @@
-# Logging guidelines
+<title># Logging guidelines
 
 This document captures the conventions for writing backend logs so they are
 useful both to a human reading them and to queries in Datadog.
@@ -75,3 +75,4 @@ Never put secrets or personal data into a message or a field. This includes:
 - tokens, secrets, and session cookies
 - personal data such as email addresses, IP addresses, or real names
 - raw request or response bodies, which may contain any of the above
+</title>
